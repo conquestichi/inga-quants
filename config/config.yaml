@@ -1,0 +1,40 @@
+# inga-quant Phase 2 — main configuration
+# Override with environment variables or per-run flags.
+
+data:
+  daily_dir: data/daily
+  margin_dir: data/margin
+  minute_features_dir: data/minute_features
+
+cache:
+  minute_dir: cache/minute_bars
+  minute_cache_days: 20  # keep this many business days; older files pruned
+
+watchlist:
+  size: 50
+  max_new: 20        # max new entries per day
+  min_retained: 30   # min entries carried over from previous day
+
+model:
+  type: Ridge        # Ridge | ElasticNet
+  alpha: 1.0
+  target: forward_return_5d
+  l1_ratio: 0.5      # only for ElasticNet
+  train_days: 365    # rolling training window (calendar days)
+  val_days: 63       # validation window
+
+gates:
+  wf_ic_threshold: 0.01
+  ticker_cv_ic_threshold: 0.00
+  param_stability_threshold: 0.70
+  missing_rate_threshold: 0.20
+  min_eligible_stocks: 5
+  confidence_threshold: 0.005
+  cost_bps: [5, 15]
+
+output:
+  base_dir: output
+
+logging:
+  log_dir: logs
+  level: INFO

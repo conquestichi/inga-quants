@@ -1,0 +1,16 @@
+# Short-term signal features (from Feature Store v1)
+# These columns must exist in features_daily.parquet
+
+features:
+  - ret_1d
+  - ret_3d
+  - ret_5d
+  - absret_1d
+  - volume_z_20d
+  - gap_1d
+  - close_to_high_1d
+  - close_pos_in_range_1d
+  - up_streak_3
+  - vol_z_20d
+  - liq_score
+  - rs_20d
