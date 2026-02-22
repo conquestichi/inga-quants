@@ -1,7 +1,19 @@
+# secrets — never commit
+.env
+
 # runtime outputs
 output/
 logs/
+artifacts/
 *.log
+
+# claude code internal state
+.claude/
+
+# python build artifacts
+*.egg-info/
+dist/
+build/
 
 # python
 __pycache__/
