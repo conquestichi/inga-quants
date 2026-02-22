@@ -68,7 +68,7 @@ def _write_decision_card(
         "no_trade_reasons": gate_result.rejection_reasons,
         "top3": top3,
         "key_metrics": {
-            "confidence": round(wf_ic, 6),
+            "confidence": round(max(0.0, wf_ic), 6),
             "wf_ic": round(wf_ic, 6),
             "n_eligible": gate_result.n_eligible,
             "missing_rate": round(gate_result.missing_rate, 4),
@@ -95,7 +95,7 @@ def _write_watchlist_csv(
         for e in watchlist:
             writer.writerow({
                 "code": e.ticker,
-                "name": e.name,
+                "name": e.name if e.name is not None else "",
                 "score": round(e.score, 6),
                 "reason_short": e.reason_short,
                 "is_new": int(e.is_new),
@@ -194,7 +194,7 @@ def _write_report_md(
         for i, e in enumerate(watchlist[:10], 1):
             new_marker = "★" if e.is_new else ""
             lines.append(
-                f"| {i} | {e.ticker} | {e.name} | {e.score:.4f} | {new_marker} | {e.reason_short} |"
+                f"| {i} | {e.ticker} | {e.name or ''} | {e.score:.4f} | {new_marker} | {e.reason_short} |"
             )
     else:
         lines.append(t("no_entries", lang))

@@ -13,6 +13,7 @@ from inga_quant.pipeline.ingest import (
     DemoLoader,
     JQuantsAuthError,
     JQuantsLoader,
+    _equities_master_to_df,
     _extract_message,
 )
 
@@ -406,15 +407,17 @@ class TestJQuantsLoaderMaster:
         resp.raise_for_status = MagicMock()
         return resp
 
-    def test_demo_loader_returns_empty_df(self):
-        """DemoLoader.fetch_master() must return empty DataFrame with correct columns."""
+    def test_demo_loader_fetch_master_returns_names(self):
+        """DemoLoader.fetch_master() returns synthetic company names for fixture tickers."""
         from inga_quant.pipeline.ingest import DemoLoader
         loader = DemoLoader(BARS_PATH)
         df = loader.fetch_master()
         assert isinstance(df, pd.DataFrame)
         assert "ticker" in df.columns
         assert "name" in df.columns
-        assert len(df) == 0
+        assert len(df) > 0, "DemoLoader must return non-empty master with company names"
+        assert df["name"].notna().all(), "All names must be non-null"
+        assert df["name"].str.endswith(" Corp").all(), "Demo names must follow '<TICKER> Corp' pattern"
 
     def test_cold_fetch_creates_cache(self, loader_with_cache):
         """First call fetches from API and writes cache parquet."""
@@ -445,6 +448,152 @@ class TestJQuantsLoaderMaster:
             df = loader.fetch_master()
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
+
+
+# ---------------------------------------------------------------------------
+# _equities_master_to_df — unit tests
+# ---------------------------------------------------------------------------
+
+class TestEquitiesMasterToDf:
+    """Unit tests for the _equities_master_to_df parsing helper."""
+
+    def test_coname_preferred_over_companyname(self):
+        """CoName takes priority when both CoName and CompanyName are present."""
+        records = [{"Code": "72030", "CoName": "トヨタ自動車", "CompanyName": "Toyota Motor"}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "name"] == "トヨタ自動車"
+
+    def test_companyname_fallback_when_no_coname(self):
+        """CompanyName is used when CoName is absent."""
+        records = [{"Code": "72030", "CompanyName": "Toyota Motor"}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "name"] == "Toyota Motor"
+
+    def test_name_fallback(self):
+        """Name field is used when CoName and CompanyName are absent."""
+        records = [{"Code": "72030", "Name": "Toyota"}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "name"] == "Toyota"
+
+    def test_conamen_en_last_resort(self):
+        """CoNameEn is used as last resort when all Japanese name fields are absent."""
+        records = [{"Code": "72030", "CoNameEn": "TOYOTA MOTOR CORP"}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "name"] == "TOYOTA MOTOR CORP"
+
+    def test_name_none_when_no_name_field(self):
+        """name is None when none of the candidate fields are present."""
+        records = [{"Code": "72030", "SomeOtherField": "xyz"}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "ticker"] == "72030"
+        assert df.loc[0, "name"] is None
+
+    def test_ticker_preserved_as_string(self):
+        """Ticker codes like '285A0' must remain strings, not be coerced to int/NaN."""
+        records = [{"Code": "285A0", "CoName": "Some Corp"}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "ticker"] == "285A0"
+        assert isinstance(df.loc[0, "ticker"], str)
+
+    def test_numeric_code_also_string(self):
+        """Even purely numeric codes like 72030 are returned as strings."""
+        records = [{"Code": 72030, "CoName": "Toyota"}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "ticker"] == "72030"
+        assert isinstance(df.loc[0, "ticker"], str)
+
+    def test_empty_records_returns_empty_df(self):
+        """Empty input returns a DataFrame with required columns and zero rows."""
+        df = _equities_master_to_df([])
+        assert isinstance(df, pd.DataFrame)
+        assert "ticker" in df.columns
+        assert "name" in df.columns
+        assert len(df) == 0
+
+    def test_records_without_code_skipped(self):
+        """Records without a 'Code' field are silently skipped."""
+        records = [
+            {"CoName": "No Code Corp"},
+            {"Code": "72030", "CoName": "Toyota"},
+        ]
+        df = _equities_master_to_df(records)
+        assert len(df) == 1
+        assert df.loc[0, "ticker"] == "72030"
+
+    def test_duplicates_deduplicated_keep_last(self):
+        """Duplicate Code entries are deduplicated; last occurrence wins."""
+        records = [
+            {"Code": "72030", "CoName": "First"},
+            {"Code": "72030", "CoName": "Second"},
+        ]
+        df = _equities_master_to_df(records)
+        assert len(df) == 1
+        assert df.loc[0, "name"] == "Second"
+
+    def test_no_keyerror_on_unknown_fields(self):
+        """No KeyError is raised when the record contains only unknown fields."""
+        records = [{"Code": "72030", "UnknownField": "whatever"}]
+        df = _equities_master_to_df(records)  # must not raise
+        assert df.loc[0, "ticker"] == "72030"
+        assert df.loc[0, "name"] is None
+
+    def test_whitespace_stripped_from_name(self):
+        """Leading/trailing whitespace in name values is stripped."""
+        records = [{"Code": "72030", "CoName": "  Toyota  "}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "name"] == "Toyota"
+
+    def test_empty_string_name_falls_through_to_next_candidate(self):
+        """An empty CoName is treated as absent; the next candidate is tried."""
+        records = [{"Code": "72030", "CoName": "", "CompanyName": "Toyota Motor"}]
+        df = _equities_master_to_df(records)
+        assert df.loc[0, "name"] == "Toyota Motor"
+
+
+class TestJQuantsLoaderMasterParsing:
+    """Integration tests: fetch_master uses _equities_master_to_df via the API path."""
+
+    @pytest.fixture
+    def loader(self, monkeypatch):
+        monkeypatch.delenv("JQUANTS_API_KEY", raising=False)
+        monkeypatch.delenv("JQUANTS_APIKEY", raising=False)
+        return JQuantsLoader(api_key="dummy-key")
+
+    def _mock_resp(self, body: dict) -> MagicMock:
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 200
+        resp.json.return_value = body
+        resp.reason = "OK"
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_coname_field_parsed_correctly(self, loader):
+        """fetch_master correctly reads CoName (the real API field name)."""
+        body = {"data": [{"Code": "72030", "CoName": "トヨタ自動車"}]}
+        with patch("requests.get", return_value=self._mock_resp(body)):
+            with patch("time.sleep"):
+                df = loader.fetch_master()
+        assert len(df) == 1
+        assert df.loc[0, "ticker"] == "72030"
+        assert df.loc[0, "name"] == "トヨタ自動車"
+
+    def test_alphanumeric_ticker_preserved(self, loader):
+        """Tickers like '285A0' are preserved as strings through the API path."""
+        body = {"data": [{"Code": "285A0", "CoName": "Some Fintech Corp"}]}
+        with patch("requests.get", return_value=self._mock_resp(body)):
+            with patch("time.sleep"):
+                df = loader.fetch_master()
+        assert df.loc[0, "ticker"] == "285A0"
+        assert isinstance(df.loc[0, "ticker"], str)
+
+    def test_no_keyerror_when_name_field_absent(self, loader):
+        """fetch_master must not raise when the response has no name-like field."""
+        body = {"data": [{"Code": "72030", "Date": "2026-02-20"}]}
+        with patch("requests.get", return_value=self._mock_resp(body)):
+            with patch("time.sleep"):
+                df = loader.fetch_master()  # must not raise
+        assert df.loc[0, "ticker"] == "72030"
+        assert df.loc[0, "name"] is None
 
 
 # ---------------------------------------------------------------------------
