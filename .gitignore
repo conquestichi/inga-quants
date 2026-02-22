@@ -14,3 +14,10 @@ artifacts/
 
 # packaging
 *.egg-info/
+
+# Phase 2 runtime directories (contents only, dirs created by make setup)
+.env
+data/daily/
+data/margin/
+data/minute_features/
+cache/minute_bars/

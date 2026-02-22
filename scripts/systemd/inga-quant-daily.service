@@ -1,0 +1,16 @@
+[Unit]
+Description=inga-quant daily pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+WorkingDirectory=/srv/inga-quants
+ExecStart=/srv/inga-quants/scripts/run_daily.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=inga-quant
+
+[Install]
+WantedBy=multi-user.target

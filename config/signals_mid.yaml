@@ -1,0 +1,14 @@
+# Mid-term signal features (from Feature Store v1)
+# These columns must exist in features_daily.parquet
+
+features:
+  - ret_20d
+  - ret_60d
+  - hh_20d
+  - vol_20
+  - vol_60
+  - vol_z_60d
+  - trend_20d
+  - trend_60d
+  - avg_traded_value_20d
+  - rs_60d
