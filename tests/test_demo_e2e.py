@@ -3,6 +3,7 @@ End-to-end demo test: runs full Phase 2 pipeline with fixture data.
 Verifies that output/<trade_date>/ contains all 4 required files + report.md + slack_payload.json.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,9 @@ AS_OF = "2026-02-10"
 def demo_out(tmp_path_factory) -> Path:
     """Run demo pipeline once; return output directory."""
     out_base = tmp_path_factory.mktemp("demo_output")
+    # Pre-set SLACK_WEBHOOK_URL to empty so dotenv auto-load won't overwrite it
+    # and send_slack() falls through to write the fallback file.
+    env = {**os.environ, "SLACK_WEBHOOK_URL": ""}
     result = subprocess.run(
         [
             sys.executable, "-m", "inga_quant.cli",
@@ -27,6 +31,7 @@ def demo_out(tmp_path_factory) -> Path:
         ],
         capture_output=True,
         text=True,
+        env=env,
     )
     assert result.returncode == 0, (
         f"Demo run failed (rc={result.returncode}):\n"
