@@ -312,10 +312,15 @@ class JQuantsLoader(DataLoader):
                 if not raw.empty:
                     raw["as_of"] = pd.to_datetime(raw["as_of"]).dt.date
                     cache = raw
-            except Exception as exc:
+            except Exception:
+                # Rename corrupt file for post-mortem; trigger cold-start refetch
+                bak = self._cache_path.with_suffix(".parquet.bak")
+                try:
+                    self._cache_path.rename(bak)
+                except Exception:
+                    pass
                 logger.warning(
-                    "キャッシュ読み込み失敗 (%s) — フルフェッチに切り替え: %s",
-                    self._cache_path.name, type(exc).__name__,
+                    "キャッシュ破損 → %s に退避しフルフェッチします", bak.name
                 )
                 cache = _EMPTY_BARS.copy()
 
@@ -344,16 +349,19 @@ class JQuantsLoader(DataLoader):
             cache = pd.concat([cache] + new_frames, ignore_index=True)
             cache = cache.drop_duplicates(subset=["as_of", "ticker"], keep="last")
             cache = cache.sort_values(["as_of", "ticker"]).reset_index(drop=True)
+            total_new = sum(len(f) for f in new_frames)
+            tmp = self._cache_path.with_suffix(".parquet.tmp")
             try:
                 self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache.to_parquet(self._cache_path, index=False)
-                total_new = sum(len(f) for f in new_frames)
+                cache.to_parquet(tmp, index=False)
+                tmp.replace(self._cache_path)   # atomic on POSIX (same filesystem)
                 logger.info(
                     "J-Quants: キャッシュ保存 (+%d行, 計%d行) → %s",
                     total_new, len(cache), self._cache_path.name,
                 )
-            except Exception as exc:
-                logger.warning("キャッシュ保存失敗: %s", type(exc).__name__)
+            except Exception:
+                logger.warning("キャッシュ保存失敗 — tmpファイルを削除します")
+                tmp.unlink(missing_ok=True)
         else:
             logger.info(
                 "J-Quants: キャッシュ新鮮 (最終日=%s)", cache["as_of"].max()

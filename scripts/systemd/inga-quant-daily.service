@@ -7,10 +7,12 @@ Wants=network-online.target
 Type=oneshot
 User=%i
 WorkingDirectory=/srv/inga-quants
+EnvironmentFile=-/srv/inga-quants/.env
 ExecStart=/srv/inga-quants/scripts/run_daily.sh
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=inga-quant
+TimeoutStartSec=3600
 
 [Install]
 WantedBy=multi-user.target

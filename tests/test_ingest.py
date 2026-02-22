@@ -364,6 +364,21 @@ class TestJQuantsLoaderCache:
         assert mock_get.call_count == 0  # no API calls
         assert len(df) == 2
 
+    def test_cache_corruption_recovery(self, loader_with_cache):
+        """Corrupt cache is renamed to .bak; full API refetch is triggered."""
+        loader, cache_file = loader_with_cache
+        cache_file.write_bytes(b"not a valid parquet file")
+
+        resp = self._mock_resp({"data": [self._record("2026-01-05")]})
+        with patch("requests.get", return_value=resp) as mock_get:
+            with patch("time.sleep"):
+                df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5))
+
+        bak = cache_file.with_suffix(".parquet.bak")
+        assert bak.exists(), ".parquet.bak must be created from corrupted cache"
+        assert mock_get.call_count == 1, "Full API refetch must follow corruption"
+        assert len(df) == 1
+
 
 # ---------------------------------------------------------------------------
 # Helpers

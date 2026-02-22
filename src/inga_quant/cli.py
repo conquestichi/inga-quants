@@ -84,6 +84,7 @@ def _cmd_build_features(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    import fcntl
     import logging
     from datetime import date, datetime
 
@@ -94,6 +95,32 @@ def _cmd_run(args: argparse.Namespace) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    # --- single-instance guard (prevent concurrent cron overlap) ---
+    lock_path = Path("logs/run.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(lock_path, "w")  # noqa: SIM115
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_fh.close()
+        print("ERROR: 多重起動を検出しました。前の run が終了するまで待ってください。", file=sys.stderr)
+        return 1
+
+    try:
+        return _run_pipeline_cmd(args, lock_fh)
+    finally:
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
+
+
+def _run_pipeline_cmd(args: argparse.Namespace, _lock_fh: object) -> int:
+    """Inner body of run command — called with run lock already held."""
+    import logging
+    from datetime import date, datetime
+
+    from inga_quant.pipeline.ingest import DemoLoader, JQuantsAuthError, JQuantsLoader
+    from inga_quant.pipeline.runner import run_pipeline
 
     if args.as_of:
         as_of = datetime.strptime(args.as_of, "%Y-%m-%d").date()
