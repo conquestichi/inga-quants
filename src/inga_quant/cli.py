@@ -2,8 +2,66 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def _load_dotenv_if_present() -> None:
+    """
+    Load .env file into os.environ (setdefault — never overwrites existing vars).
+
+    Search order: ./.env → <repo-root>/.env (parent containing pyproject.toml).
+    Parses KEY=VALUE lines; skips blank lines and # comments.
+    Strips surrounding whitespace and quotes (" or ') from values.
+    Logs one INFO line with key names only — never values.
+    """
+    candidates: list[Path] = [Path(".env")]
+
+    # Walk up to find repo root (contains pyproject.toml)
+    here = Path(__file__).resolve().parent
+    for parent in [here, *here.parents]:
+        if (parent / "pyproject.toml").exists():
+            repo_env = parent / ".env"
+            if repo_env not in candidates:
+                candidates.append(repo_env)
+            break
+
+    loaded_from: Path | None = None
+    loaded_keys: list[str] = []
+
+    for candidate in candidates:
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            # Strip surrounding quotes
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            if key not in os.environ:
+                os.environ[key] = value
+                loaded_keys.append(key)
+
+        loaded_from = candidate
+        break
+
+    if loaded_from and loaded_keys:
+        logger.debug(".env loaded from %s: %s", loaded_from, ", ".join(loaded_keys))
 
 
 def _cmd_build_features(args: argparse.Namespace) -> int:
@@ -29,7 +87,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     import logging
     from datetime import date, datetime
 
-    from inga_quant.pipeline.ingest import DemoLoader, JQuantsLoader
+    from inga_quant.pipeline.ingest import DemoLoader, JQuantsAuthError, JQuantsLoader
     from inga_quant.pipeline.runner import run_pipeline
 
     logging.basicConfig(
@@ -50,7 +108,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         loader = DemoLoader(bars_path=fixture)
         bars_path = fixture
     else:
-        loader = JQuantsLoader()
+        try:
+            loader = JQuantsLoader()
+        except JQuantsAuthError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
         bars_path = None
 
     out_base = Path(args.out) if args.out else None
@@ -74,7 +136,26 @@ def _cmd_prune_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_smoke_check(args: argparse.Namespace) -> int:
+    """Quick API connectivity smoke test (3 lines output max)."""
+    from inga_quant.pipeline.ingest import JQuantsAuthError, JQuantsLoader
+
+    try:
+        loader = JQuantsLoader()
+        ok = loader.check_connectivity()
+        if ok:
+            print("J-Quants API: OK")
+            return 0
+        else:
+            print("J-Quants API: 接続失敗（ネットワークまたはサーバーエラー）")
+            return 1
+    except JQuantsAuthError as exc:
+        print(f"J-Quants API: 認証エラー — {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> None:
+    _load_dotenv_if_present()
     parser = argparse.ArgumentParser(prog="inga_quant.cli")
     sub = parser.add_subparsers(dest="command")
 
@@ -97,6 +178,9 @@ def main(argv: list[str] | None = None) -> None:
     p_prune.add_argument("--days", type=int, default=20, help="Keep this many business days")
     p_prune.add_argument("--cache-dir", default="cache/minute_bars", help="Cache directory path")
 
+    # smoke-check (V2 API connectivity)
+    sub.add_parser("smoke-check", help="J-Quants V2 API key connectivity check (3 lines)")
+
     args = parser.parse_args(argv)
 
     if args.command == "build-features":
@@ -105,6 +189,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(_cmd_run(args))
     elif args.command == "prune-cache":
         sys.exit(_cmd_prune_cache(args))
+    elif args.command == "smoke-check":
+        sys.exit(_cmd_smoke_check(args))
     else:
         parser.print_help()
         sys.exit(1)
