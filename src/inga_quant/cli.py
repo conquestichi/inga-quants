@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -64,6 +65,98 @@ def _load_dotenv_if_present() -> None:
         logger.debug(".env loaded from %s: %s", loaded_from, ", ".join(loaded_keys))
 
 
+# ---------------------------------------------------------------------------
+# Run-lock helpers
+# ---------------------------------------------------------------------------
+
+def _read_lock_info(lock_path: Path) -> dict | None:
+    """Read JSON from lock file. Returns None if missing or unreadable."""
+    try:
+        return json.loads(lock_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _pid_exists(pid: int) -> bool:
+    """Return True if a process with *pid* exists on this system."""
+    try:
+        os.kill(pid, 0)   # signal 0 = existence check, no signal sent
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True       # process exists; we just can't signal it
+
+
+def _acquire_run_lock(lock_path: Path) -> "object | None":
+    """
+    Acquire an exclusive non-blocking flock on lock_path.
+
+    Returns the open file handle on success — caller must release via
+    ``fcntl.flock(fh, LOCK_UN)`` + ``fh.close()`` in a finally block.
+
+    Returns None on failure:
+    - Active lock (PID still running) → prints error with PID.
+    - Stale lock  (PID gone)          → auto-deletes file and retries once.
+    - Retry failed                    → prints error.
+    """
+    import fcntl
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read existing lock info BEFORE opening in 'w' mode, which truncates the file.
+    existing_info: dict | None = _read_lock_info(lock_path)
+
+    def _try_acquire():
+        fh = open(lock_path, "w", encoding="utf-8")  # noqa: SIM115
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
+        # Lock acquired — record our identity so future runs can inspect it.
+        info = {
+            "pid": os.getpid(),
+            "started_at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds"),
+        }
+        json.dump(info, fh, ensure_ascii=False)
+        fh.flush()
+        return fh
+
+    fh = _try_acquire()
+    if fh is not None:
+        return fh
+
+    # flock failed — decide: stale or active?
+    lock_pid: int | None = existing_info.get("pid") if existing_info else None
+    lock_started: str = existing_info.get("started_at", "不明") if existing_info else "不明"
+
+    if lock_pid is not None and _pid_exists(lock_pid):
+        print(
+            f"ERROR: 実行中のプロセスを検出しました (pid={lock_pid}, 開始={lock_started})。\n"
+            "       完了を待つか、問題がある場合は run --force で強制解除してください。",
+            file=sys.stderr,
+        )
+        return None
+
+    # Stale lock — auto-recover.
+    print(
+        f"警告: staleロックを検出 (pid={lock_pid}, 開始={lock_started})。"
+        " プロセスが存在しないため自動復旧します。",
+        file=sys.stderr,
+    )
+    lock_path.unlink(missing_ok=True)
+    fh = _try_acquire()
+    if fh is None:
+        print(
+            "ERROR: ロック再取得に失敗しました。他のプロセスが同時に起動した可能性があります。",
+            file=sys.stderr,
+        )
+    return fh
+
+
 def _cmd_build_features(args: argparse.Namespace) -> int:
     from inga_quant.features.build_features import build_features
     from inga_quant.utils.io import load_bars, load_events, save_parquet
@@ -86,25 +179,30 @@ def _cmd_build_features(args: argparse.Namespace) -> int:
 def _cmd_run(args: argparse.Namespace) -> int:
     import fcntl
     import logging
-    from datetime import date, datetime
-
-    from inga_quant.pipeline.ingest import DemoLoader, JQuantsAuthError, JQuantsLoader
-    from inga_quant.pipeline.runner import run_pipeline
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    # --- single-instance guard (prevent concurrent cron overlap) ---
     lock_path = Path("logs/run.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fh = open(lock_path, "w")  # noqa: SIM115
-    try:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        lock_fh.close()
-        print("ERROR: 多重起動を検出しました。前の run が終了するまで待ってください。", file=sys.stderr)
+
+    # --force: explicitly clear any existing lock before acquiring.
+    if getattr(args, "force", False):
+        existing = _read_lock_info(lock_path)
+        if existing:
+            pid = existing.get("pid")
+            started = existing.get("started_at", "不明")
+            alive = pid is not None and _pid_exists(pid)
+            status = f"実行中 pid={pid}" if alive else f"stale pid={pid}"
+            print(
+                f"--force: 既存のロックを強制解除します [{status}, 開始={started}]",
+                file=sys.stderr,
+            )
+        lock_path.unlink(missing_ok=True)
+
+    lock_fh = _acquire_run_lock(lock_path)
+    if lock_fh is None:
         return 1
 
     try:
@@ -214,6 +312,7 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--out", default=None, help="Output base directory")
     p_run.add_argument("--config", default=None, help="Path to config YAML")
     p_run.add_argument("--lang", default="ja", choices=["ja", "en"], help="Output language (default: ja)")
+    p_run.add_argument("--force", action="store_true", help="既存のロックを強制解除して実行（stale時は自動復旧）")
 
     # prune-cache (Phase 2)
     p_prune = sub.add_parser("prune-cache", help="Prune old minute-bar cache files")
