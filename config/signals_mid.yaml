@@ -12,4 +12,3 @@ features:
   - trend_60d
   - avg_traded_value_20d
   - rs_60d
-  - market_regime

@@ -302,7 +302,11 @@ def gate_leak_detection(
         for feat in feature_names:
             if feat not in df_notna.columns:
                 continue
-            col = df_notna[feat].fillna(0)
+            col = df_notna[feat]
+            # Skip non-numeric columns
+            if not pd.api.types.is_numeric_dtype(col):
+                continue
+            col = col.fillna(0)
             tgt = df_notna[TARGET_COL]
             if col.std() > 0 and tgt.std() > 0:
                 corr = float(col.corr(tgt))

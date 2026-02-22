@@ -77,8 +77,15 @@ def run_pipeline(
     # Feature building
     # ------------------------------------------------------------------
     price_col = "adj_close" if "adj_close" in bars.columns else "close"
+    # Compute forward returns from raw bars (needs price column, not from features)
+    bars_with_fwd = add_forward_return(bars, price_col=price_col, periods=5)
     features = build_features(bars)
-    features = add_forward_return(features, price_col=price_col, periods=5)
+    # Merge forward return into features for gate/model use
+    fwd_series = bars_with_fwd.set_index(["as_of", "ticker"])["forward_return_5d"]
+    features = features.copy()
+    features["forward_return_5d"] = (
+        features.set_index(["as_of", "ticker"]).index.map(fwd_series)
+    )
 
     # ------------------------------------------------------------------
     # Config
