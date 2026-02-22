@@ -25,3 +25,7 @@ __pycache__/
 # os/editor
 .DS_Store
 .vscode/
+
+# local cache / scratch
+data/daily/
+data/master/
