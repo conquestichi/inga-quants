@@ -6,6 +6,7 @@ import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -37,6 +38,7 @@ def run_pipeline(
     out_base: Path | None = None,
     config_path: Path | None = None,
     prev_watchlist: list[str] | None = None,
+    lang: str = "ja",
 ) -> Path:
     """
     Execute the full Phase 2 pipeline for a given as_of date.
@@ -74,6 +76,12 @@ def run_pipeline(
     logger.info("Loaded %d rows of bars (%d tickers)", len(bars), bars["ticker"].nunique())
 
     # ------------------------------------------------------------------
+    # Equities master (company names) — non-fatal if unavailable
+    # ------------------------------------------------------------------
+    master_dir = Path(cfg.get("data", {}).get("master_dir", "data/master"))
+    master_df = loader.fetch_master(cache_path=master_dir / "equities_master.parquet")
+
+    # ------------------------------------------------------------------
     # Feature building
     # ------------------------------------------------------------------
     price_col = "adj_close" if "adj_close" in bars.columns else "close"
@@ -86,6 +94,13 @@ def run_pipeline(
     features["forward_return_5d"] = (
         features.set_index(["as_of", "ticker"]).index.map(fwd_series)
     )
+
+    # Join company names (fallback to ticker code if master unavailable)
+    if not master_df.empty and "ticker" in master_df.columns:
+        name_map = master_df.set_index("ticker")["name"]
+        features["name"] = features["ticker"].map(name_map).fillna(features["ticker"])
+    else:
+        features["name"] = features["ticker"]
 
     # ------------------------------------------------------------------
     # Config
@@ -155,12 +170,15 @@ def run_pipeline(
     # Manifest
     # ------------------------------------------------------------------
     digest = inputs_digest(bars_path) if bars_path and bars_path.exists() else "n/a"
+    generated_at_jst = datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds")
     manifest = {
         "run_id": run_id,
         "code_hash": code_hash(),
         "inputs_digest": digest,
+        "as_of": str(as_of),
         "data_asof": str(as_of),
         "trade_date": td_str,
+        "generated_at_jst": generated_at_jst,
         "params": {
             "model": model_cfg.model_type,
             "alpha": model_cfg.alpha,
@@ -180,13 +198,20 @@ def run_pipeline(
         watchlist=watchlist,
         manifest=manifest,
         wf_ic=wf_ic,
+        lang=lang,
     )
 
     # ------------------------------------------------------------------
     # Slack / fallback
     # ------------------------------------------------------------------
     top3 = [
-        {"rank": i + 1, "ticker": e.ticker, "score": round(e.score, 6), "reason_short": e.reason_short}
+        {
+            "rank": i + 1,
+            "ticker": e.ticker,
+            "name": e.name,
+            "score": round(e.score, 6),
+            "reason_short": e.reason_short,
+        }
         for i, e in enumerate(watchlist[:3])
     ]
     slack_payload = build_slack_payload(
@@ -197,6 +222,7 @@ def run_pipeline(
         n_eligible=gate_result.n_eligible,
         no_trade_reasons=gate_result.rejection_reasons,
         top3=top3,
+        lang=lang,
     )
     send_slack(
         payload=slack_payload,

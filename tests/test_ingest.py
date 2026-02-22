@@ -381,6 +381,73 @@ class TestJQuantsLoaderCache:
 
 
 # ---------------------------------------------------------------------------
+# JQuantsLoader — equities master fetch
+# ---------------------------------------------------------------------------
+
+class TestJQuantsLoaderMaster:
+    @pytest.fixture
+    def loader(self, monkeypatch):
+        monkeypatch.delenv("JQUANTS_API_KEY", raising=False)
+        monkeypatch.delenv("JQUANTS_APIKEY", raising=False)
+        return JQuantsLoader(api_key="dummy-key")
+
+    @pytest.fixture
+    def loader_with_cache(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("JQUANTS_API_KEY", raising=False)
+        monkeypatch.delenv("JQUANTS_APIKEY", raising=False)
+        cache_file = tmp_path / "equities_master.parquet"
+        return JQuantsLoader(api_key="dummy"), cache_file
+
+    def _mock_resp(self, body: dict) -> MagicMock:
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 200
+        resp.json.return_value = body
+        resp.reason = "OK"
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_demo_loader_returns_empty_df(self):
+        """DemoLoader.fetch_master() must return empty DataFrame with correct columns."""
+        from inga_quant.pipeline.ingest import DemoLoader
+        loader = DemoLoader(BARS_PATH)
+        df = loader.fetch_master()
+        assert isinstance(df, pd.DataFrame)
+        assert "ticker" in df.columns
+        assert "name" in df.columns
+        assert len(df) == 0
+
+    def test_cold_fetch_creates_cache(self, loader_with_cache):
+        """First call fetches from API and writes cache parquet."""
+        loader, cache_file = loader_with_cache
+        body = {"data": [{"Code": "72030", "CompanyName": "トヨタ自動車"}]}
+        resp = self._mock_resp(body)
+        with patch("requests.get", return_value=resp):
+            with patch("time.sleep"):
+                df = loader.fetch_master(cache_path=cache_file)
+        assert len(df) == 1
+        assert df["ticker"].iloc[0] == "72030"
+        assert df["name"].iloc[0] == "トヨタ自動車"
+        assert cache_file.exists()
+
+    def test_warm_cache_no_api_call(self, loader_with_cache):
+        """Cache < 24h old → no API call."""
+        loader, cache_file = loader_with_cache
+        seed = pd.DataFrame([{"ticker": "72030", "name": "トヨタ自動車"}])
+        seed.to_parquet(cache_file, index=False)
+        with patch("requests.get") as mock_get:
+            df = loader.fetch_master(cache_path=cache_file)
+        assert mock_get.call_count == 0
+        assert len(df) == 1
+
+    def test_exception_returns_empty_df(self, loader):
+        """Network error → returns empty df, does not raise."""
+        with patch("requests.get", side_effect=ConnectionError("network down")):
+            df = loader.fetch_master()
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) == 0
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

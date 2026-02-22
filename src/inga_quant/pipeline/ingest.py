@@ -57,6 +57,12 @@ _COL_MAP = {
     "AdjFactor": "adj_factor",
 }
 
+# J-Quants /v2/equities/master column → internal name
+_MASTER_COL_MAP = {
+    "Code": "ticker",
+    "CompanyName": "name",
+}
+
 _EMPTY_BARS = pd.DataFrame(
     columns=["as_of", "ticker", "open", "high", "low", "close", "volume"]
 )
@@ -77,6 +83,14 @@ class DataLoader(ABC):
         tickers: list[str] | None = None,
     ) -> pd.DataFrame:
         """Return bars_daily DataFrame with columns matching SPEC §1.1."""
+
+    def fetch_master(self, cache_path: Path | None = None) -> pd.DataFrame:
+        """Return equities master DataFrame with 'ticker' and 'name' columns.
+
+        Default implementation returns an empty DataFrame (no API access).
+        Override in subclasses that support master data fetching.
+        """
+        return pd.DataFrame(columns=["ticker", "name"])
 
 
 class DemoLoader(DataLoader):
@@ -392,6 +406,67 @@ class JQuantsLoader(DataLoader):
         if self._cache_path is not None and not tickers:
             return self._fetch_with_cache(start_date, end_date)
         return self._fetch_api_range(start_date, end_date, tickers)
+
+    def fetch_master(self, cache_path: Path | None = None) -> pd.DataFrame:
+        """
+        Fetch equities master from /v2/equities/master and cache to parquet.
+
+        Returns a DataFrame with 'ticker' (Code) and 'name' (CompanyName) columns.
+        Cache is considered fresh for 24 hours.
+        On any error, logs a warning and returns an empty DataFrame so the
+        pipeline can continue without company names.
+        """
+        # Use cached version if fresh (< 24 h)
+        if cache_path and cache_path.exists():
+            try:
+                age_h = (time.time() - cache_path.stat().st_mtime) / 3600
+                if age_h < 24:
+                    cached = pd.read_parquet(cache_path)
+                    if not cached.empty and "ticker" in cached.columns:
+                        logger.info("マスターキャッシュ使用 (%.1fh前)", age_h)
+                        return cached
+            except Exception:
+                pass
+
+        # Fetch from API with pagination
+        try:
+            all_records: list[dict] = []
+            params: dict[str, str] = {}
+            while True:
+                resp = self._get("/v2/equities/master", params=params)
+                all_records.extend(resp.get("data", []))
+                pkey = resp.get("pagination_key")
+                if not pkey:
+                    break
+                params["pagination_key"] = pkey
+                time.sleep(_REQUEST_INTERVAL)
+
+            if not all_records:
+                logger.warning("マスター: 取得レコード 0件")
+                return pd.DataFrame(columns=["ticker", "name"])
+
+            df = pd.DataFrame(all_records)
+            df = df.rename(columns={k: v for k, v in _MASTER_COL_MAP.items() if k in df.columns})
+            df = df[["ticker", "name"]].drop_duplicates(subset=["ticker"])
+
+            if cache_path:
+                tmp = cache_path.with_suffix(".parquet.tmp")
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    df.to_parquet(tmp, index=False)
+                    tmp.replace(cache_path)
+                    logger.info("マスター保存: %d銘柄 → %s", len(df), cache_path.name)
+                except Exception:
+                    logger.warning("マスターキャッシュ保存失敗")
+                    tmp.unlink(missing_ok=True)
+
+            return df
+
+        except JQuantsAuthError:
+            raise
+        except Exception as exc:
+            logger.warning("マスター取得失敗 (%s) — 社名なしで続行", type(exc).__name__)
+            return pd.DataFrame(columns=["ticker", "name"])
 
 
 # ------------------------------------------------------------------

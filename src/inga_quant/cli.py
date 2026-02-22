@@ -147,14 +147,24 @@ def _run_pipeline_cmd(args: argparse.Namespace, _lock_fh: object) -> int:
         bars_path = None
 
     out_base = Path(args.out) if args.out else None
+    lang = getattr(args, "lang", "ja")
     out_dir = run_pipeline(
         as_of=as_of,
         loader=loader,
         bars_path=bars_path,
         out_base=out_base,
         config_path=Path(args.config) if args.config else None,
+        lang=lang,
     )
+
+    # Keep output/latest pointing at the most recent trade_date directory
+    latest = out_dir.parent / "latest"
+    if latest.is_symlink() or latest.exists():
+        latest.unlink()
+    latest.symlink_to(out_dir.name)   # relative symlink, e.g. "2026-02-10"
+
     print(f"Output: {out_dir}")
+    print(f"Latest: {latest} → {out_dir.name}")
     return 0
 
 
@@ -203,6 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--demo", action="store_true", help="Use fixture data (no API calls)")
     p_run.add_argument("--out", default=None, help="Output base directory")
     p_run.add_argument("--config", default=None, help="Path to config YAML")
+    p_run.add_argument("--lang", default="ja", choices=["ja", "en"], help="Output language (default: ja)")
 
     # prune-cache (Phase 2)
     p_prune = sub.add_parser("prune-cache", help="Prune old minute-bar cache files")

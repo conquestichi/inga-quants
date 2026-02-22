@@ -37,8 +37,8 @@ def demo_out(tmp_path_factory) -> Path:
         f"Demo run failed (rc={result.returncode}):\n"
         f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
     )
-    # Find the trade_date directory
-    subdirs = [d for d in out_base.iterdir() if d.is_dir()]
+    # Find the trade_date directory (exclude the latest symlink)
+    subdirs = [d for d in out_base.iterdir() if d.is_dir() and not d.is_symlink()]
     assert len(subdirs) == 1, f"Expected exactly 1 output subdir, got: {[d.name for d in subdirs]}"
     return subdirs[0]
 
@@ -142,6 +142,39 @@ def test_dates_consistent(demo_out):
     card = json.loads(next(demo_out.glob("decision_card_*.json")).read_text())
     report = json.loads(next(demo_out.glob("quality_report_*.json")).read_text())
     assert card["trade_date"] == report["trade_date"]
+
+
+def test_latest_symlink_exists(demo_out):
+    """output/latest must be a symlink pointing to the trade_date directory."""
+    latest = demo_out.parent / "latest"
+    assert latest.is_symlink(), "output/latest symlink must be created after run"
+    assert latest.resolve() == demo_out.resolve(), "latest must resolve to the current trade_date dir"
+
+
+def test_manifest_json_exists(demo_out):
+    assert (demo_out / "manifest.json").exists(), "stable manifest.json must be written"
+
+
+def test_manifest_json_has_required_fields(demo_out):
+    manifest = json.loads((demo_out / "manifest.json").read_text())
+    for key in ("as_of", "trade_date", "generated_at_jst"):
+        assert key in manifest, f"Missing required field in manifest.json: {key}"
+
+
+def test_slack_payload_is_japanese(demo_out):
+    payload = json.loads((demo_out / "slack_payload.json").read_text())
+    assert "アクション" in payload["text"], "Slack message must contain Japanese 'アクション' label"
+
+
+def test_report_md_japanese_headings(demo_out):
+    md = next(demo_out.glob("report_*.md")).read_text()
+    assert "日次レポート" in md or "主要指標" in md, "report.md must contain Japanese headings"
+
+
+def test_decision_card_top3_has_name(demo_out):
+    card = json.loads(next(demo_out.glob("decision_card_*.json")).read_text())
+    for item in card["top3"]:
+        assert "name" in item, f"decision_card top3 item missing 'name': {item}"
 
 
 def test_phase1_cli_still_works(tmp_path):

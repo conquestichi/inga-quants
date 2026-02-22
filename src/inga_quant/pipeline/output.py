@@ -10,6 +10,7 @@ from typing import Any
 
 from inga_quant.pipeline.gates import AllGatesResult
 from inga_quant.pipeline.watchlist import WatchlistEntry
+from inga_quant.ui.i18n import get as t
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ def write_outputs(
     watchlist: list[WatchlistEntry],
     manifest: dict[str, Any],
     wf_ic: float = 0.0,
+    lang: str = "ja",
 ) -> dict[str, Path]:
     """Write all Phase 2 output files. Returns {name: path} dict."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -34,7 +36,7 @@ def write_outputs(
     paths["watchlist_50"] = _write_watchlist_csv(out_dir, td_str, watchlist)
     paths["quality_report"] = _write_quality_report(out_dir, td_str, run_id, gate_result)
     paths["manifest"] = _write_manifest(out_dir, run_id, manifest)
-    paths["report_md"] = _write_report_md(out_dir, td_str, run_id, gate_result, watchlist, wf_ic)
+    paths["report_md"] = _write_report_md(out_dir, td_str, run_id, gate_result, watchlist, wf_ic, lang)
 
     return paths
 
@@ -52,6 +54,7 @@ def _write_decision_card(
         {
             "rank": i + 1,
             "ticker": e.ticker,
+            "name": e.name,
             "score": round(e.score, 6),
             "reason_short": e.reason_short,
         }
@@ -129,6 +132,8 @@ def _write_quality_report(
 def _write_manifest(out_dir: Path, run_id: str, manifest: dict[str, Any]) -> Path:
     path = out_dir / f"manifest_{run_id}.json"
     _write_json(path, manifest)
+    # Also write a stable manifest.json so output/latest/manifest.json always works
+    _write_json(out_dir / "manifest.json", manifest)
     logger.info("Written manifest: %s", path)
     return path
 
@@ -140,48 +145,59 @@ def _write_report_md(
     gate_result: AllGatesResult,
     watchlist: list[WatchlistEntry],
     wf_ic: float,
+    lang: str = "ja",
 ) -> Path:
     action = "TRADE" if gate_result.all_passed else "NO_TRADE"
     lines = [
-        f"# inga-quant Daily Report — {td_str}",
+        t("report_title", lang).format(td_str=td_str),
         "",
         f"**run_id**: `{run_id}`",
         f"**action**: **{action}**",
         "",
     ]
     if gate_result.rejection_reasons:
-        lines += ["## NO_TRADE Reasons", ""]
+        lines += [t("no_trade_reasons_hd", lang), ""]
         for r in gate_result.rejection_reasons:
             lines.append(f"- {r}")
         lines.append("")
 
+    col_m = t("col_metric", lang)
+    col_v = t("col_value", lang)
     lines += [
-        "## Key Metrics",
+        t("key_metrics_hd", lang),
         "",
-        f"| Metric | Value |",
-        f"|--------|-------|",
-        f"| WF IC | {wf_ic:.4f} |",
-        f"| Eligible stocks | {gate_result.n_eligible} |",
-        f"| Missing rate | {gate_result.missing_rate:.1%} |",
+        f"| {col_m} | {col_v} |",
+        f"|{'—' * (len(col_m) + 2)}|{'—' * (len(col_v) + 2)}|",
+        f"| {t('lbl_wf_ic', lang)} | {wf_ic:.4f} |",
+        f"| {t('lbl_eligible', lang)} | {gate_result.n_eligible} |",
+        f"| {t('lbl_missing', lang)} | {gate_result.missing_rate:.1%} |",
         "",
-        "## Quality Gates",
+        t("quality_gates_hd", lang),
         "",
-        "| Gate | Result |",
-        "|------|--------|",
+        f"| {t('col_gate', lang)} | {t('col_result', lang)} |",
+        f"|{'—' * (len(t('col_gate', lang)) + 2)}|{'—' * (len(t('col_result', lang)) + 2)}|",
     ]
     for name, r in gate_result.gates.items():
-        status = "✓ PASS" if r.passed else "✗ FAIL"
+        status = t("pass", lang) if r.passed else t("fail", lang)
         lines.append(f"| {name} | {status} |")
 
-    lines += ["", "## Watchlist Top 10", ""]
+    lines += ["", t("watchlist_hd", lang), ""]
     if watchlist:
-        lines.append("| Rank | Ticker | Score | New? | Reason |")
-        lines.append("|------|--------|-------|------|--------|")
+        r_rank = t("col_rank", lang)
+        r_code = t("col_ticker", lang)
+        r_name = t("col_name", lang)
+        r_score = t("col_score", lang)
+        r_new = t("col_new", lang)
+        r_reason = t("col_reason", lang)
+        lines.append(f"| {r_rank} | {r_code} | {r_name} | {r_score} | {r_new} | {r_reason} |")
+        lines.append(f"|{'—'*4}|{'—'*6}|{'—'*8}|{'—'*7}|{'—'*4}|{'—'*6}|")
         for i, e in enumerate(watchlist[:10], 1):
             new_marker = "★" if e.is_new else ""
-            lines.append(f"| {i} | {e.ticker} | {e.score:.4f} | {new_marker} | {e.reason_short} |")
+            lines.append(
+                f"| {i} | {e.ticker} | {e.name} | {e.score:.4f} | {new_marker} | {e.reason_short} |"
+            )
     else:
-        lines.append("_(no watchlist entries)_")
+        lines.append(t("no_entries", lang))
 
     path = out_dir / f"report_{td_str}.md"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -9,6 +9,8 @@ from typing import Any
 
 import requests
 
+from inga_quant.ui.i18n import get as t
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,23 +22,29 @@ def build_slack_payload(
     n_eligible: int,
     no_trade_reasons: list[str],
     top3: list[dict[str, Any]],
+    lang: str = "ja",
 ) -> dict[str, Any]:
     """Build Slack message payload."""
     icon = ":white_check_mark:" if action == "TRADE" else ":no_entry:"
-    top3_text = "\n".join(
-        f"  {e['rank']}. {e['ticker']}  score={e['score']:.4f}  {e['reason_short']}"
-        for e in top3
-    ) or "  (none)"
+
+    top3_lines = []
+    for e in top3:
+        name_part = f" {e['name']}" if e.get("name") and e["name"] != e["ticker"] else ""
+        top3_lines.append(
+            f"  {e['rank']}. {e['ticker']}{name_part}  score={e['score']:.4f}  {e['reason_short']}"
+        )
+    top3_text = "\n".join(top3_lines) or t("slack_none", lang)
+
     reasons_text = (
-        "\n".join(f"  • {r}" for r in no_trade_reasons) or "  none"
+        "\n".join(f"  • {r}" for r in no_trade_reasons) or t("slack_none", lang)
     )
 
     text = (
-        f"{icon} *inga-quant daily report — {trade_date}*\n"
-        f"Action: *{action}*\n"
-        f"WF IC: {wf_ic:.4f}  |  Eligible: {n_eligible}\n"
-        f"Top 3:\n{top3_text}\n"
-        f"NO_TRADE reasons:\n{reasons_text}"
+        f"{icon} *{t('slack_title', lang).format(date=trade_date)}*\n"
+        f"{t('slack_action', lang).format(action=action)}\n"
+        f"{t('slack_metrics', lang).format(wf_ic=wf_ic, n_eligible=n_eligible)}\n"
+        f"{t('slack_top3_hd', lang)}\n{top3_text}\n"
+        f"{t('slack_reasons_hd', lang)}\n{reasons_text}"
     )
     return {"text": text}
 
