@@ -108,8 +108,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         loader = DemoLoader(bars_path=fixture)
         bars_path = fixture
     else:
+        from inga_quant.utils.config import load_config
+        cfg = load_config(Path(args.config) if args.config else None)
+        daily_dir = cfg.get("data", {}).get("daily_dir", "data/daily")
+        cache_path = Path(daily_dir) / "bars_cache.parquet"
         try:
-            loader = JQuantsLoader()
+            loader = JQuantsLoader(cache_path=cache_path)
         except JQuantsAuthError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1

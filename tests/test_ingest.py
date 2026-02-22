@@ -269,6 +269,101 @@ class TestJQuantsLoaderRetry:
             with pytest.raises(JQuantsAuthError):
                 loader.check_connectivity()
 
+    def test_retry_after_header_honoured(self, loader):
+        """429 with Retry-After: 5 → sleeps 5s, not the default 1s backoff."""
+        rate_resp = MagicMock(spec=requests.Response)
+        rate_resp.status_code = 429
+        rate_resp.headers = {"Retry-After": "5"}
+        rate_resp.json.return_value = {}
+        rate_resp.raise_for_status = MagicMock()
+
+        ok_resp = MagicMock(spec=requests.Response)
+        ok_resp.status_code = 200
+        ok_resp.json.return_value = {"data": []}
+        ok_resp.raise_for_status = MagicMock()
+
+        sleep_calls: list[float] = []
+        with patch("requests.get", side_effect=[rate_resp, ok_resp]):
+            with patch("time.sleep", side_effect=lambda s: sleep_calls.append(s)):
+                loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
+
+        assert any(s >= 5.0 for s in sleep_calls), f"Expected ≥5s sleep, got {sleep_calls}"
+
+
+# ---------------------------------------------------------------------------
+# JQuantsLoader — incremental cache
+# ---------------------------------------------------------------------------
+
+class TestJQuantsLoaderCache:
+    """Verify that cache_path enables incremental fetch."""
+
+    @pytest.fixture
+    def loader_with_cache(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("JQUANTS_API_KEY", raising=False)
+        monkeypatch.delenv("JQUANTS_APIKEY", raising=False)
+        cache_file = tmp_path / "bars_cache.parquet"
+        return JQuantsLoader(api_key="dummy", cache_path=cache_file), cache_file
+
+    def _mock_resp(self, body: dict) -> MagicMock:
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 200
+        resp.json.return_value = body
+        resp.reason = "OK"
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def _record(self, d: str, ticker: str = "72030") -> dict:
+        return {"Date": d, "Code": ticker, "O": 100, "H": 105, "L": 99, "C": 103, "Vo": 1000}
+
+    def test_cold_start_creates_cache(self, loader_with_cache):
+        """First call (no cache file) fetches from API and writes cache."""
+        loader, cache_file = loader_with_cache
+        resp = self._mock_resp({"data": [self._record("2026-01-05")]})
+        with patch("requests.get", return_value=resp):
+            with patch("time.sleep"):
+                df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5))
+        assert len(df) == 1
+        assert cache_file.exists()
+
+    def test_warm_fetches_only_new_dates(self, loader_with_cache):
+        """Cache covers day 1; only day 2 should be fetched from API."""
+        loader, cache_file = loader_with_cache
+        import pandas as pd
+        # Pre-seed cache with day 1
+        from datetime import date as _date
+        seed = pd.DataFrame([{
+            "as_of": _date(2026, 1, 5), "ticker": "72030",
+            "open": 100.0, "high": 105.0, "low": 99.0, "close": 103.0, "volume": 1000.0,
+        }])
+        seed.to_parquet(cache_file, index=False)
+
+        resp = self._mock_resp({"data": [self._record("2026-01-06")]})
+        with patch("requests.get", return_value=resp) as mock_get:
+            with patch("time.sleep"):
+                df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 6))
+
+        assert mock_get.call_count == 1  # only 1 API call for the new day
+        assert len(df) == 2              # both days in result
+
+    def test_fresh_cache_needs_no_api_call(self, loader_with_cache):
+        """Cache covers full range → zero API calls."""
+        loader, cache_file = loader_with_cache
+        import pandas as pd
+        from datetime import date as _date
+        seed = pd.DataFrame([
+            {"as_of": _date(2026, 1, 5), "ticker": "72030",
+             "open": 100.0, "high": 105.0, "low": 99.0, "close": 103.0, "volume": 1000.0},
+            {"as_of": _date(2026, 1, 6), "ticker": "72030",
+             "open": 103.0, "high": 108.0, "low": 102.0, "close": 107.0, "volume": 1200.0},
+        ])
+        seed.to_parquet(cache_file, index=False)
+
+        with patch("requests.get") as mock_get:
+            df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 6))
+
+        assert mock_get.call_count == 0  # no API calls
+        assert len(df) == 2
+
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -1,4 +1,25 @@
-"""Data ingestion: DataLoader ABC, JQuantsLoader (V2 API key), DemoLoader (fixture)."""
+"""Data ingestion: DataLoader ABC, JQuantsLoader (V2 API key), DemoLoader (fixture).
+
+V2 API constraint
+-----------------
+/v2/equities/bars/daily requires either ``code`` or ``date`` in every request.
+There is no date-range-for-all-tickers mode, so all-market fetches iterate by
+business day (one HTTP request per day).
+
+Caching strategy (timer/cron)
+------------------------------
+Set ``cache_path`` on JQuantsLoader to enable an incremental parquet cache:
+- Cold start: fetches entire date range (~252 calls for 365-day lookback), saves cache.
+- Warm (daily cron): reads cache, fetches only new business days (typically 1–3 calls).
+This makes daily cron nearly free after the first run.
+
+Rate limit defence
+------------------
+- 429: honour Retry-After header if present, else exponential backoff.
+- 0.2s inter-request sleep between consecutive HTTP calls in date/ticker loops.
+- 5xx: exponential backoff, max 3 retries.
+- 403: immediate failure (invalid key or endpoint).
+"""
 from __future__ import annotations
 
 import logging
@@ -21,6 +42,7 @@ _JQUANTS_BASE = "https://api.jquants.com"
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0
 _BACKOFF_CAP = 30.0
+_REQUEST_INTERVAL = 0.2   # seconds between consecutive API calls (pacing)
 
 # J-Quants V2 /equities/bars/daily abbreviated column → internal name
 _COL_MAP = {
@@ -80,18 +102,22 @@ class JQuantsLoader(DataLoader):
     """
     J-Quants V2 API client.
 
-    Authentication: ``x-api-key: <api_key>`` header (no token refresh).
-    API key is read from env ``JQUANTS_API_KEY`` (or compat ``JQUANTS_APIKEY``).
-    Retry: exponential backoff on 429 / 5xx. 403 → immediate failure with guidance.
-
-    fetch_daily strategy
-    --------------------
-    - tickers provided: one request-set per ticker using ``code`` + ``from``/``to`` params.
-    - tickers=None (all market): one request per business day using ``date=`` param.
-      This matches the V2 API constraint that either ``code`` or ``date`` must be specified.
+    Parameters
+    ----------
+    api_key:
+        Override env ``JQUANTS_API_KEY`` / ``JQUANTS_APIKEY``.
+    cache_path:
+        Optional path to a parquet file used as an incremental bars cache.
+        When set and ``tickers=None``, only missing business days are fetched
+        from the API; all other data is served from the cache.
+        Example: ``cache_path=Path("data/daily/bars_cache.parquet")``
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        cache_path: str | Path | None = None,
+    ) -> None:
         self._api_key = (
             api_key
             or os.environ.get("JQUANTS_API_KEY")
@@ -103,6 +129,7 @@ class JQuantsLoader(DataLoader):
                 "J-Quants APIキーが未設定です。"
                 " .env に JQUANTS_API_KEY=<key> を設定してください。"
             )
+        self._cache_path = Path(cache_path) if cache_path else None
 
     # ------------------------------------------------------------------
     # HTTP
@@ -140,10 +167,14 @@ class JQuantsLoader(DataLoader):
                         "— APIキーが無効か期限切れです。ダッシュボードで再発行して .env を更新してください。"
                     )
 
-                # 429 → rate limit, backoff
+                # 429 → rate limit; honour Retry-After header if present
                 if resp.status_code == 429:
-                    logger.warning("J-Quants rate limited (attempt %d). retry in %.0fs", attempt, delay)
-                    time.sleep(delay)
+                    raw_after = resp.headers.get("Retry-After", "")
+                    wait = float(raw_after) if raw_after.strip().isdigit() else delay
+                    logger.warning(
+                        "J-Quants rate limited (attempt %d). retry in %.0fs", attempt, wait
+                    )
+                    time.sleep(wait)
                     delay = min(delay * 2, _BACKOFF_CAP)
                     continue
 
@@ -191,7 +222,7 @@ class JQuantsLoader(DataLoader):
             return False
 
     # ------------------------------------------------------------------
-    # Data fetch
+    # Data fetch — internal helpers
     # ------------------------------------------------------------------
 
     def _fetch_all_pages(self, params: dict[str, str]) -> list[dict]:
@@ -209,25 +240,22 @@ class JQuantsLoader(DataLoader):
             if not pkey:
                 break
             p["pagination_key"] = pkey
+            time.sleep(_REQUEST_INTERVAL)   # pace between pagination calls
         return all_records
 
-    def fetch_daily(
+    def _fetch_api_range(
         self,
         start_date: date,
         end_date: date,
         tickers: list[str] | None = None,
     ) -> pd.DataFrame:
-        """
-        Fetch daily OHLCV bars from J-Quants V2 /v2/equities/bars/daily.
-
-        V2 API requires either ``code`` or ``date`` in every request:
-        - tickers provided → per-ticker requests with code + from/to params.
-        - tickers=None → one request per business day using date= param.
-        """
+        """Raw API fetch — no cache layer."""
         if tickers:
             # Per-ticker mode: code + from + to
             all_records: list[dict] = []
-            for ticker in tickers:
+            for i, ticker in enumerate(tickers):
+                if i > 0:
+                    time.sleep(_REQUEST_INTERVAL)   # pace between tickers
                 params: dict[str, str] = {
                     "code": ticker,
                     "from": start_date.isoformat(),
@@ -241,11 +269,15 @@ class JQuantsLoader(DataLoader):
             n_days = 0
             while current <= end_date:
                 if is_business_day(current):
+                    if n_days > 0:
+                        time.sleep(_REQUEST_INTERVAL)   # pace between dates
                     records = self._fetch_all_pages({"date": current.isoformat()})
                     all_records.extend(records)
                     n_days += 1
                 current += timedelta(days=1)
-            logger.info("J-Quants: %d営業日分リクエスト完了 (%s–%s)", n_days, start_date, end_date)
+            logger.info(
+                "J-Quants: %d営業日分リクエスト完了 (%s–%s)", n_days, start_date, end_date
+            )
 
         if not all_records:
             logger.info("J-Quants: 取得レコード 0件 (%s–%s)", start_date, end_date)
@@ -261,6 +293,97 @@ class JQuantsLoader(DataLoader):
             len(df), df["ticker"].nunique(), start_date, end_date,
         )
         return df.reset_index(drop=True)
+
+    def _fetch_with_cache(self, start_date: date, end_date: date) -> pd.DataFrame:
+        """
+        Incremental fetch backed by a parquet cache file.
+
+        On cold start (no cache): fetches full [start_date, end_date] and saves.
+        On warm start: reads cache, fetches only business days after the last
+        cached date, appends to cache, and returns the requested slice.
+        If the cache doesn't reach back to start_date, the missing early range
+        is fetched and prepended.
+        """
+        cache = _EMPTY_BARS.copy()
+
+        if self._cache_path.exists():
+            try:
+                raw = pd.read_parquet(self._cache_path)
+                if not raw.empty:
+                    raw["as_of"] = pd.to_datetime(raw["as_of"]).dt.date
+                    cache = raw
+            except Exception as exc:
+                logger.warning(
+                    "キャッシュ読み込み失敗 (%s) — フルフェッチに切り替え: %s",
+                    self._cache_path.name, type(exc).__name__,
+                )
+                cache = _EMPTY_BARS.copy()
+
+        new_frames: list[pd.DataFrame] = []
+
+        if cache.empty:
+            # Cold start
+            new_frames.append(self._fetch_api_range(start_date, end_date))
+        else:
+            cache_min: date = cache["as_of"].min()
+            cache_max: date = cache["as_of"].max()
+
+            # Fill gap at the tail (most common: new trading day)
+            tail_start = cache_max + timedelta(days=1)
+            if tail_start <= end_date:
+                new_frames.append(self._fetch_api_range(tail_start, end_date))
+
+            # Fill gap at the head (rare: train_days extended or cache rebuilt)
+            if cache_min > start_date:
+                logger.warning(
+                    "キャッシュ先頭 %s > 要求開始 %s — 差分を先頭に追加します", cache_min, start_date
+                )
+                new_frames.append(self._fetch_api_range(start_date, cache_min - timedelta(days=1)))
+
+        if new_frames:
+            cache = pd.concat([cache] + new_frames, ignore_index=True)
+            cache = cache.drop_duplicates(subset=["as_of", "ticker"], keep="last")
+            cache = cache.sort_values(["as_of", "ticker"]).reset_index(drop=True)
+            try:
+                self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache.to_parquet(self._cache_path, index=False)
+                total_new = sum(len(f) for f in new_frames)
+                logger.info(
+                    "J-Quants: キャッシュ保存 (+%d行, 計%d行) → %s",
+                    total_new, len(cache), self._cache_path.name,
+                )
+            except Exception as exc:
+                logger.warning("キャッシュ保存失敗: %s", type(exc).__name__)
+        else:
+            logger.info(
+                "J-Quants: キャッシュ新鮮 (最終日=%s)", cache["as_of"].max()
+            )
+
+        # Return requested slice
+        if cache.empty:
+            return _EMPTY_BARS.copy()
+        mask = (cache["as_of"] >= start_date) & (cache["as_of"] <= end_date)
+        return cache[mask].reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def fetch_daily(
+        self,
+        start_date: date,
+        end_date: date,
+        tickers: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """
+        Fetch daily OHLCV bars from J-Quants V2 /v2/equities/bars/daily.
+
+        When ``cache_path`` is set and ``tickers=None``, uses the incremental
+        parquet cache — only new business days are fetched from the API.
+        """
+        if self._cache_path is not None and not tickers:
+            return self._fetch_with_cache(start_date, end_date)
+        return self._fetch_api_range(start_date, end_date, tickers)
 
 
 # ------------------------------------------------------------------
