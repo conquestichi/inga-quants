@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from inga_quant.features.build_features import build_features
@@ -95,12 +96,13 @@ def run_pipeline(
         features.set_index(["as_of", "ticker"]).index.map(fwd_series)
     )
 
-    # Join company names (fallback to ticker code if master unavailable)
+    # Join company names from master; name=None when master unavailable or ticker not found.
+    # Do NOT fall back to ticker — None signals "name unknown" to downstream consumers.
     if not master_df.empty and "ticker" in master_df.columns:
         name_map = master_df.set_index("ticker")["name"]
-        features["name"] = features["ticker"].map(name_map).fillna(features["ticker"])
+        features["name"] = features["ticker"].map(name_map)  # NaN for unmapped tickers
     else:
-        features["name"] = features["ticker"]
+        features["name"] = np.nan  # Master unavailable; all names unknown
 
     # ------------------------------------------------------------------
     # Config

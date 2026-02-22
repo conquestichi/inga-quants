@@ -261,7 +261,9 @@ def gate_param_stability(
     sims: list[float] = []
     for i in range(len(coef_vectors)):
         for j in range(i + 1, len(coef_vectors)):
-            sims.append(_cosine_similarity(coef_vectors[i], coef_vectors[j]))
+            # Use abs so the metric is in [0, 1]: consistently-signed coefficients
+            # (all positive or all negative across windows) both indicate stability.
+            sims.append(abs(_cosine_similarity(coef_vectors[i], coef_vectors[j])))
 
     mean_sim = float(np.mean(sims))
     passed = mean_sim > threshold

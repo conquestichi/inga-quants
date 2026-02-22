@@ -32,6 +32,47 @@ _COEF = {"ret_1d": 1.0, "ret_20d": 0.5, "liq_score": 0.3, "rs_20d": 0.2}
 _AS_OF = date(2026, 2, 10)
 
 
+class TestWatchlistNameMapping:
+    def test_name_from_features_column(self):
+        """When features has a 'name' column, WatchlistEntry.name uses it."""
+        features = _make_features(10, _AS_OF)
+        features["name"] = features["ticker"].apply(lambda t: f"{t} Co")
+        result = build_watchlist(features, _AS_OF, _COEF, _FEATURES)
+        assert len(result) > 0
+        for e in result:
+            assert e.name is not None, f"{e.ticker}: name should not be None when master present"
+            assert e.name.endswith(" Co"), (
+                f"{e.ticker}: expected '<TICKER> Co', got '{e.name}'"
+            )
+            assert e.name != e.ticker, (
+                f"{e.ticker}: name must differ from ticker when master is available"
+            )
+
+    def test_name_is_none_when_no_name_column(self):
+        """When features has no 'name' column, WatchlistEntry.name is None."""
+        features = _make_features(10, _AS_OF)
+        # No 'name' column — simulates master unavailable
+        result = build_watchlist(features, _AS_OF, _COEF, _FEATURES)
+        assert len(result) > 0
+        for e in result:
+            assert e.name is None, (
+                f"{e.ticker}: name should be None when 'name' column absent, got '{e.name}'"
+            )
+
+    def test_name_is_none_when_master_unmapped(self):
+        """When master has names for only some tickers, unmapped tickers get name=None."""
+        features = _make_features(10, _AS_OF)
+        # Only map first 5 tickers; rest are NaN
+        name_map = {f"T{i:03d}": f"T{i:03d} Ltd" for i in range(5)}
+        features["name"] = features["ticker"].map(name_map)  # NaN for T005-T009
+        result = build_watchlist(features, _AS_OF, _COEF, _FEATURES)
+        for e in result:
+            if e.ticker in name_map:
+                assert e.name is not None and e.name.endswith(" Ltd")
+            else:
+                assert e.name is None
+
+
 class TestWatchlistBasic:
     def test_returns_at_most_size_entries(self):
         features = _make_features(100, _AS_OF)

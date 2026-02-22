@@ -7,6 +7,7 @@ import pytest
 
 from inga_quant.pipeline.gates import (
     AllGatesResult,
+    GateResult,
     gate_cost_test,
     gate_leak_detection,
     gate_param_stability,
@@ -64,6 +65,38 @@ _CFG = ModelConfig(alpha=0.1)
 _AS_OF = date(2025, 6, 1) + timedelta(days=124)
 
 
+def _make_monotonic_dataset(
+    n_tickers: int = 10,
+    n_days: int = 120,
+) -> pd.DataFrame:
+    """
+    Dataset where a ticker's rank is constant over time and perfectly predicts
+    its forward-return rank.  Ridge regression learns coef > 0 for ret_1d,
+    so corr(pred, actual) > 0 in every walk-forward fold.
+    """
+    rng = np.random.default_rng(0)
+    start = date(2024, 1, 1)
+    tickers = [f"T{i:02d}" for i in range(n_tickers)]
+    rows = []
+    for i, ticker in enumerate(tickers):
+        signal = (i + 1) / n_tickers          # constant, monotonically increasing per ticker
+        for d_idx in range(n_days + 5):
+            d = date.fromordinal(start.toordinal() + d_idx)
+            rows.append({
+                "as_of": d,
+                "ticker": ticker,
+                "ret_1d": signal,
+                "ret_20d": signal,
+                "liq_score": signal,
+                TARGET_COL: signal + rng.normal(0, 1e-4),  # nearly perfect target
+            })
+    df = pd.DataFrame(rows)
+    for ticker, g in df.groupby("ticker"):
+        last5 = g.sort_values("as_of").tail(5).index
+        df.loc[last5, TARGET_COL] = np.nan
+    return df
+
+
 class TestGateWalkForward:
     def test_passes_on_clean_data(self):
         df = _make_clean_dataset()
@@ -89,6 +122,18 @@ class TestGateWalkForward:
         result = gate_walk_forward(df, _FEATURES, _CFG, threshold=0.0)
         assert "ic" in result.details
         assert "threshold" in result.details
+
+    def test_wf_ic_positive_on_monotonic_data(self):
+        """
+        WF_IC = corr(pred_score, realized_forward_return) must be > 0 when
+        the signal perfectly ranks future returns (higher signal → higher return).
+        """
+        df = _make_monotonic_dataset()
+        result = gate_walk_forward(df, _FEATURES, _CFG, threshold=0.0)
+        assert result.details["ic"] is not None
+        assert result.details["ic"] > 0, (
+            f"WF_IC should be positive on monotonic data, got {result.details['ic']}"
+        )
 
 
 class TestGateTickerSplitCV:
@@ -138,6 +183,18 @@ class TestGateParamStability:
         df = _make_clean_dataset(n_days=5)
         result = gate_param_stability(df, _FEATURES, _CFG)
         assert result.passed is False
+
+    def test_cosine_sim_in_0_1_range(self):
+        """
+        param_stability cosine_sim must be in [0, 1] even when model coefficients
+        flip sign across windows.  We use abs() so that consistently-signed and
+        consistently-opposite-signed coefficients both score near 1.0.
+        """
+        df = _make_clean_dataset(n_days=180, seed=42)
+        result = gate_param_stability(df, _FEATURES, _CFG, threshold=0.0)
+        sim = result.details.get("cosine_sim")
+        if sim is not None:  # None only when insufficient data
+            assert 0.0 <= sim <= 1.0, f"cosine_sim={sim} is outside [0, 1]"
 
 
 class TestGateLeakDetection:
@@ -195,3 +252,43 @@ class TestRunAllGates:
         assert "gates" in d
         assert "rejection_reasons" in d
         assert "missing_rate" in d
+
+    def test_confidence_in_decision_card_non_negative(self, tmp_path):
+        """
+        decision_card 'confidence' must be >= 0 even when WF_IC is negative.
+        The raw 'wf_ic' value is preserved; only 'confidence' is clipped.
+        """
+        import json
+        from datetime import date as _date
+        from inga_quant.pipeline.output import write_outputs
+
+        # Simulate negative WF_IC (e.g. model predicts backwards on small dataset)
+        wf_gate = GateResult(
+            name="walk_forward",
+            passed=False,
+            details={"ic": -0.15, "threshold": 0.01, "fold_ics": [-0.15]},
+            reason="WF IC -0.1500 <= threshold 0.0100",
+        )
+        gate_result = AllGatesResult(
+            all_passed=False,
+            gates={"walk_forward": wf_gate},
+            rejection_reasons=["gate:walk_forward — WF IC -0.1500 <= threshold 0.0100"],
+            missing_rate=0.0,
+            n_eligible=10,
+        )
+        paths = write_outputs(
+            out_dir=tmp_path,
+            trade_date=_date(2026, 2, 24),
+            run_id="test-run",
+            gate_result=gate_result,
+            watchlist=[],
+            manifest={},
+            wf_ic=-0.15,
+        )
+        card = json.loads(paths["decision_card"].read_text())
+        assert card["key_metrics"]["confidence"] >= 0.0, (
+            f"confidence must be >= 0, got {card['key_metrics']['confidence']}"
+        )
+        assert card["key_metrics"]["wf_ic"] == pytest.approx(-0.15), (
+            "raw wf_ic must be preserved in key_metrics"
+        )

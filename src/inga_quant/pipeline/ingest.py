@@ -57,11 +57,50 @@ _COL_MAP = {
     "AdjFactor": "adj_factor",
 }
 
-# J-Quants /v2/equities/master column → internal name
-_MASTER_COL_MAP = {
-    "Code": "ticker",
-    "CompanyName": "name",
-}
+# Field-name candidates (in priority order) for each internal column.
+# The live /v2/equities/master API returns "CoName"; older snapshots may use
+# "CompanyName" or "Name".  We try all known variants so a single key missing
+# from the response never raises a KeyError.
+_MASTER_NAME_CANDIDATES = ("CoName", "CompanyName", "Name", "CoNameEn")
+
+
+def _equities_master_to_df(records: list[dict]) -> pd.DataFrame:
+    """
+    Parse raw /v2/equities/master records into a clean DataFrame.
+
+    Rules
+    -----
+    - ticker : str — always taken from "Code"; preserved as string so codes
+      like "285A0" are not silently coerced to int / NaN.
+    - name   : str | None — first non-empty value found among
+      CoName → CompanyName → Name → CoNameEn; None if all absent.
+    - Duplicates are dropped, keeping the last occurrence per ticker.
+    - Never raises KeyError regardless of which fields the API returns.
+    """
+    _EMPTY = pd.DataFrame(columns=["ticker", "name"])
+    if not records:
+        return _EMPTY
+
+    rows: list[dict] = []
+    for rec in records:
+        code = rec.get("Code")
+        if code is None:
+            continue
+        name: str | None = None
+        for cand in _MASTER_NAME_CANDIDATES:
+            val = rec.get(cand)
+            if val is not None and str(val).strip():
+                name = str(val).strip()
+                break
+        rows.append({"ticker": str(code), "name": name})
+
+    if not rows:
+        return _EMPTY
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset=["ticker"], keep="last")
+    return df.reset_index(drop=True)
+
 
 _EMPTY_BARS = pd.DataFrame(
     columns=["as_of", "ticker", "open", "high", "low", "close", "volume"]
@@ -110,6 +149,15 @@ class DemoLoader(DataLoader):
         if tickers:
             df = df[df["ticker"].isin(tickers)]
         return df.reset_index(drop=True)
+
+    def fetch_master(self, cache_path: Path | None = None) -> pd.DataFrame:
+        """Return synthetic company names derived from fixture tickers."""
+        df = load_bars(self._bars_path)
+        tickers = sorted(df["ticker"].unique())
+        return pd.DataFrame({
+            "ticker": tickers,
+            "name": [f"{t} Corp" for t in tickers],
+        })
 
 
 class JQuantsLoader(DataLoader):
@@ -411,7 +459,8 @@ class JQuantsLoader(DataLoader):
         """
         Fetch equities master from /v2/equities/master and cache to parquet.
 
-        Returns a DataFrame with 'ticker' (Code) and 'name' (CompanyName) columns.
+        Returns a DataFrame with 'ticker' (Code as str) and 'name' (CoName or
+        CompanyName / Name / CoNameEn fallback chain; None when absent) columns.
         Cache is considered fresh for 24 hours.
         On any error, logs a warning and returns an empty DataFrame so the
         pipeline can continue without company names.
@@ -445,9 +494,7 @@ class JQuantsLoader(DataLoader):
                 logger.warning("マスター: 取得レコード 0件")
                 return pd.DataFrame(columns=["ticker", "name"])
 
-            df = pd.DataFrame(all_records)
-            df = df.rename(columns={k: v for k, v in _MASTER_COL_MAP.items() if k in df.columns})
-            df = df[["ticker", "name"]].drop_duplicates(subset=["ticker"])
+            df = _equities_master_to_df(all_records)
 
             if cache_path:
                 tmp = cache_path.with_suffix(".parquet.tmp")

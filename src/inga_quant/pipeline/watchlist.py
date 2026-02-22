@@ -21,7 +21,7 @@ class WatchlistConfig:
 @dataclass
 class WatchlistEntry:
     ticker: str
-    name: str
+    name: str | None  # None when company name is unavailable from master
     score: float
     reason_short: str
     is_new: bool
@@ -118,9 +118,11 @@ def build_watchlist(
 
     entries: list[WatchlistEntry] = []
     for _, row in selected.iterrows():
+        name_raw = row.get("name")
+        name = str(name_raw) if pd.notna(name_raw) else None
         entries.append(WatchlistEntry(
             ticker=str(row["ticker"]),
-            name=str(row.get("name", row["ticker"])),
+            name=name,
             score=float(row["_adj_score"]),
             reason_short=_reason_short(row, signal_features),
             is_new=bool(row["_is_new"]),
