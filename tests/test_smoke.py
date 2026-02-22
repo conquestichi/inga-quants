@@ -1,4 +1,4 @@
-from inga_quants.cli import main
+from inga_quant.cli import main
 
 def test_main(capsys):
     main()

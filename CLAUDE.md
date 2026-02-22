@@ -31,7 +31,7 @@ ruff format .
 
 ## Architecture
 
-- `src/inga_quants/` — Main package
+- `src/inga_quant/` — Main package
   - `cli.py` — CLI entry point (`main()` function)
   - `__init__.py` — Package exports
 - `tests/` — pytest tests (uses `capsys` for output capture)
