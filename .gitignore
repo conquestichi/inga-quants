@@ -11,3 +11,6 @@ artifacts/
 .claude/
 .vscode/
 .DS_Store
+
+# packaging
+*.egg-info/
