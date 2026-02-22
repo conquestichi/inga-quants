@@ -5,13 +5,14 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import requests
 
+from inga_quant.pipeline.trade_date import is_business_day
 from inga_quant.utils.io import load_bars
 
 logger = logging.getLogger(__name__)
@@ -21,17 +22,17 @@ _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0
 _BACKOFF_CAP = 30.0
 
-# J-Quants V2 column → internal name
+# J-Quants V2 /equities/bars/daily abbreviated column → internal name
 _COL_MAP = {
     "Date": "as_of",
     "Code": "ticker",
-    "Open": "open",
-    "High": "high",
-    "Low": "low",
-    "Close": "close",
-    "Volume": "volume",
-    "AdjustmentClose": "adj_close",
-    "AdjustmentFactor": "adj_factor",
+    "O": "open",
+    "H": "high",
+    "L": "low",
+    "C": "close",
+    "Vo": "volume",
+    "AdjC": "adj_close",
+    "AdjFactor": "adj_factor",
 }
 
 _EMPTY_BARS = pd.DataFrame(
@@ -82,6 +83,12 @@ class JQuantsLoader(DataLoader):
     Authentication: ``x-api-key: <api_key>`` header (no token refresh).
     API key is read from env ``JQUANTS_API_KEY`` (or compat ``JQUANTS_APIKEY``).
     Retry: exponential backoff on 429 / 5xx. 403 → immediate failure with guidance.
+
+    fetch_daily strategy
+    --------------------
+    - tickers provided: one request-set per ticker using ``code`` + ``from``/``to`` params.
+    - tickers=None (all market): one request per business day using ``date=`` param.
+      This matches the V2 API constraint that either ``code`` or ``date`` must be specified.
     """
 
     def __init__(self, api_key: str | None = None) -> None:
@@ -125,7 +132,7 @@ class JQuantsLoader(DataLoader):
                     timeout=30,
                 )
 
-                # 403 → invalid key, no retry
+                # 403 → invalid key or bad endpoint, no retry
                 if resp.status_code == 403:
                     msg = _extract_message(resp)
                     raise JQuantsAuthError(
@@ -187,6 +194,23 @@ class JQuantsLoader(DataLoader):
     # Data fetch
     # ------------------------------------------------------------------
 
+    def _fetch_all_pages(self, params: dict[str, str]) -> list[dict]:
+        """
+        Fetch all pages for the given base params from /v2/equities/bars/daily.
+        Handles pagination_key automatically.
+        """
+        all_records: list[dict] = []
+        p = dict(params)
+        while True:
+            resp = self._get("/v2/equities/bars/daily", params=p)
+            records = resp.get("data", [])
+            all_records.extend(records)
+            pkey = resp.get("pagination_key")
+            if not pkey:
+                break
+            p["pagination_key"] = pkey
+        return all_records
+
     def fetch_daily(
         self,
         start_date: date,
@@ -194,29 +218,34 @@ class JQuantsLoader(DataLoader):
         tickers: list[str] | None = None,
     ) -> pd.DataFrame:
         """
-        Fetch daily OHLCV bars from J-Quants V2 /v2/prices/daily_quotes.
-        Handles pagination automatically.
+        Fetch daily OHLCV bars from J-Quants V2 /v2/equities/bars/daily.
+
+        V2 API requires either ``code`` or ``date`` in every request:
+        - tickers provided → per-ticker requests with code + from/to params.
+        - tickers=None → one request per business day using date= param.
         """
-        params: dict[str, str] = {
-            "date_from": start_date.strftime("%Y-%m-%d"),
-            "date_to": end_date.strftime("%Y-%m-%d"),
-        }
-        # Single-ticker shortcut
-        if tickers and len(tickers) == 1:
-            params["code"] = tickers[0]
-
-        all_records: list[dict] = []
-        pagination_key: str | None = None
-
-        while True:
-            if pagination_key:
-                params["pagination_key"] = pagination_key
-            resp = self._get("/v2/prices/daily_quotes", params=params)
-            records = resp.get("daily_quotes", [])
-            all_records.extend(records)
-            pagination_key = resp.get("pagination_key")
-            if not pagination_key:
-                break
+        if tickers:
+            # Per-ticker mode: code + from + to
+            all_records: list[dict] = []
+            for ticker in tickers:
+                params: dict[str, str] = {
+                    "code": ticker,
+                    "from": start_date.isoformat(),
+                    "to": end_date.isoformat(),
+                }
+                all_records.extend(self._fetch_all_pages(params))
+        else:
+            # All-market mode: one request per business day
+            all_records = []
+            current = start_date
+            n_days = 0
+            while current <= end_date:
+                if is_business_day(current):
+                    records = self._fetch_all_pages({"date": current.isoformat()})
+                    all_records.extend(records)
+                    n_days += 1
+                current += timedelta(days=1)
+            logger.info("J-Quants: %d営業日分リクエスト完了 (%s–%s)", n_days, start_date, end_date)
 
         if not all_records:
             logger.info("J-Quants: 取得レコード 0件 (%s–%s)", start_date, end_date)
@@ -226,9 +255,6 @@ class JQuantsLoader(DataLoader):
         df = df.rename(columns={k: v for k, v in _COL_MAP.items() if k in df.columns})
         df["as_of"] = pd.to_datetime(df["as_of"]).dt.date
         df["ticker"] = df["ticker"].astype(str)
-
-        if tickers and len(tickers) > 1:
-            df = df[df["ticker"].isin(tickers)]
 
         logger.info(
             "J-Quants: %d件取得 (%d銘柄, %s–%s)",

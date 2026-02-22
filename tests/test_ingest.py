@@ -1,7 +1,6 @@
-"""Tests for ingest.py — JQuantsLoader (V2 API key) and DemoLoader."""
+"""Tests for ingest.py — JQuantsLoader (V2 /equities/bars/daily) and DemoLoader."""
 from __future__ import annotations
 
-import json
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -79,11 +78,11 @@ class TestJQuantsLoaderAuth:
 
 
 # ---------------------------------------------------------------------------
-# JQuantsLoader — x-api-key header is sent
+# JQuantsLoader — V2 endpoint + x-api-key header
 # ---------------------------------------------------------------------------
 
 class TestJQuantsLoaderHeaders:
-    """Verify that x-api-key header is always included in requests."""
+    """Verify correct V2 endpoint URL and x-api-key header."""
 
     @pytest.fixture
     def loader(self, monkeypatch):
@@ -99,11 +98,19 @@ class TestJQuantsLoaderHeaders:
         resp.raise_for_status = MagicMock()
         return resp
 
-    def test_x_api_key_header_sent(self, loader):
-        body = {"daily_quotes": [], "pagination_key": None}
-        resp = self._mock_resp(200, body)
+    def test_url_is_equities_bars_daily(self, loader):
+        """Requests must go to /v2/equities/bars/daily — old /v2/prices/daily_quotes is gone."""
+        resp = self._mock_resp(200, {"data": []})
         with patch("requests.get", return_value=resp) as mock_get:
-            loader.fetch_daily(date(2026, 1, 1), date(2026, 1, 5))
+            loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
+        url = mock_get.call_args[0][0]
+        assert "/v2/equities/bars/daily" in url
+        assert "/v2/prices/daily_quotes" not in url
+
+    def test_x_api_key_header_sent(self, loader):
+        resp = self._mock_resp(200, {"data": []})
+        with patch("requests.get", return_value=resp) as mock_get:
+            loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
         call_kwargs = mock_get.call_args
         headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers", {})
         assert "x-api-key" in headers, "x-api-key header must be present"
@@ -113,42 +120,40 @@ class TestJQuantsLoaderHeaders:
         resp = self._mock_resp(403, {"message": "The incoming api key is invalid or expired."})
         with patch("requests.get", return_value=resp):
             with pytest.raises(JQuantsAuthError) as exc_info:
-                loader.fetch_daily(date(2026, 1, 1), date(2026, 1, 5))
-        # Error message must be short and actionable
+                loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
         msg = str(exc_info.value)
         assert "無効" in msg or "invalid" in msg.lower()
         assert "ダッシュボード" in msg or ".env" in msg
 
     def test_403_message_does_not_include_full_body(self, loader):
-        """Confirm we only log .message field, not the entire response body."""
+        """Only .message field in error text, not entire response body."""
         long_body = {"message": "short msg", "extra_field": "x" * 5000}
         resp = self._mock_resp(403, long_body)
         with patch("requests.get", return_value=resp):
             with pytest.raises(JQuantsAuthError) as exc_info:
-                loader.fetch_daily(date(2026, 1, 1), date(2026, 1, 5))
+                loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
         assert "x" * 100 not in str(exc_info.value), "Full body must not appear in error"
 
     def test_returns_empty_dataframe_on_no_records(self, loader):
-        body = {"daily_quotes": []}
-        resp = self._mock_resp(200, body)
+        resp = self._mock_resp(200, {"data": []})
         with patch("requests.get", return_value=resp):
-            df = loader.fetch_daily(date(2026, 1, 1), date(2026, 1, 5))
+            df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
 
     def test_pagination_followed(self, loader):
-        """Second call uses pagination_key; both batches are combined."""
+        """Second call uses pagination_key; both pages are combined."""
         page1 = {
-            "daily_quotes": [
-                {"Date": "2026-01-05", "Code": "72030", "Open": 100, "High": 105,
-                 "Low": 99, "Close": 103, "Volume": 1000}
+            "data": [
+                {"Date": "2026-01-05", "Code": "72030", "O": 100, "H": 105,
+                 "L": 99, "C": 103, "Vo": 1000}
             ],
             "pagination_key": "next-page-token",
         }
         page2 = {
-            "daily_quotes": [
-                {"Date": "2026-01-06", "Code": "72030", "Open": 103, "High": 108,
-                 "Low": 102, "Close": 107, "Volume": 1200}
+            "data": [
+                {"Date": "2026-01-06", "Code": "72030", "O": 103, "H": 108,
+                 "L": 102, "C": 107, "Vo": 1200}
             ],
         }
         responses = [MagicMock(spec=requests.Response), MagicMock(spec=requests.Response)]
@@ -158,33 +163,62 @@ class TestJQuantsLoaderHeaders:
             r.raise_for_status = MagicMock()
 
         with patch("requests.get", side_effect=responses) as mock_get:
-            df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 6))
+            df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 6), tickers=["72030"])
 
         assert mock_get.call_count == 2
         assert len(df) == 2
 
     def test_column_mapping(self, loader):
-        """V2 column names are mapped to internal names."""
+        """V2 abbreviated column names are mapped to internal names."""
         body = {
-            "daily_quotes": [{
+            "data": [{
                 "Date": "2026-01-05",
                 "Code": "72030",
-                "Open": 100.0,
-                "High": 105.0,
-                "Low": 98.0,
-                "Close": 103.0,
-                "Volume": 5000,
-                "AdjustmentClose": 103.0,
-                "AdjustmentFactor": 1.0,
+                "O": 100.0,
+                "H": 105.0,
+                "L": 98.0,
+                "C": 103.0,
+                "Vo": 5000,
+                "AdjC": 103.0,
+                "AdjFactor": 1.0,
             }]
         }
         resp = self._mock_resp(200, body)
         with patch("requests.get", return_value=resp):
-            df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5))
+            df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
         assert "as_of" in df.columns
         assert "ticker" in df.columns
+        assert "open" in df.columns
+        assert "high" in df.columns
+        assert "low" in df.columns
+        assert "close" in df.columns
+        assert "volume" in df.columns
         assert "adj_close" in df.columns
         assert df["ticker"].iloc[0] == "72030"
+
+    def test_date_iteration_no_tickers(self, loader):
+        """No tickers → one request per business day via date= param."""
+        # 2026-01-05 Mon and 2026-01-06 Tue are both business days (no holiday)
+        day1_body = {"data": [{"Date": "2026-01-05", "Code": "72030",
+                                "O": 100, "H": 105, "L": 99, "C": 103, "Vo": 1000}]}
+        day2_body = {"data": [{"Date": "2026-01-06", "Code": "72030",
+                                "O": 103, "H": 108, "L": 102, "C": 107, "Vo": 1200}]}
+        resp1 = self._mock_resp(200, day1_body)
+        resp2 = self._mock_resp(200, day2_body)
+
+        with patch("requests.get", side_effect=[resp1, resp2]) as mock_get:
+            df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 6))
+
+        assert mock_get.call_count == 2
+        assert len(df) == 2
+        # Verify date= param was used (not code=)
+        calls = mock_get.call_args_list
+        dates_sent = [
+            c.kwargs.get("params", c[1].get("params", {})).get("date")
+            for c in calls
+        ]
+        assert "2026-01-05" in dates_sent
+        assert "2026-01-06" in dates_sent
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +239,12 @@ class TestJQuantsLoaderRetry:
 
         ok_resp = MagicMock(spec=requests.Response)
         ok_resp.status_code = 200
-        ok_resp.json.return_value = {"daily_quotes": []}
+        ok_resp.json.return_value = {"data": []}
         ok_resp.raise_for_status = MagicMock()
 
         with patch("requests.get", side_effect=[err_resp, ok_resp]) as mock_get:
             with patch("time.sleep"):  # don't actually sleep
-                df = loader.fetch_daily(date(2026, 1, 1), date(2026, 1, 5))
+                df = loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
         assert mock_get.call_count == 2
         assert len(df) == 0
 
@@ -222,8 +256,7 @@ class TestJQuantsLoaderRetry:
 
         with patch("requests.get", return_value=resp) as mock_get:
             with pytest.raises(JQuantsAuthError):
-                loader.fetch_daily(date(2026, 1, 1), date(2026, 1, 5))
-        # Must not retry on 403
+                loader.fetch_daily(date(2026, 1, 5), date(2026, 1, 5), tickers=["72030"])
         assert mock_get.call_count == 1
 
     def test_check_connectivity_raises_auth_error(self, loader):
