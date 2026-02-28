@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/inga-prod-apply
+# Applies the production systemd profile for inga:
+#   - enables + starts allowlisted units
+#   - disables + masks denylisted units
+#   - resets failed state
+#   - verifies no allowlisted unit remains in failed state
+#
+# Idempotent: safe to run multiple times. Never prompts for input.
+# Designed to run via NOPASSWD sudo.
+#
+# One-time setup (as root):
+#   sudo cp shutdown/deploy/inga-prod-apply /usr/local/sbin/
+#   sudo chown root:root /usr/local/sbin/inga-prod-apply
+#   sudo chmod 755 /usr/local/sbin/inga-prod-apply
+#   sudo cp shutdown/deploy/inga-sudoers-prod /etc/sudoers.d/inga-prod-apply
+#   sudo chmod 440 /etc/sudoers.d/inga-prod-apply
+#   sudo visudo -c
+#
+# Usage:
+#   sudo -n inga-prod-apply             # apply production profile
+#   sudo -n inga-prod-apply --dry-run   # show what would happen (works without root)
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+DRY_RUN=0
+for arg in "$@"; do [[ "$arg" == "--dry-run" ]] && DRY_RUN=1; done
+
+_ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+_log() { echo "$(_ts) [INFO] $*"; }
+_warn(){ echo "$(_ts) [WARN] $*" >&2; }
+_dry() { echo "$(_ts) [DRY]  $*"; }
+
+# ---------------------------------------------------------------------------
+# Root check (only for normal mode; --dry-run works without root)
+# ---------------------------------------------------------------------------
+if [[ "$DRY_RUN" -eq 0 && "$(id -u)" -ne 0 ]]; then
+  echo "[ERR] inga-prod-apply must run as root." >&2
+  echo "      Fix: sudo -n inga-prod-apply" >&2
+  echo "      If you get 'sudo: a password is required', set up NOPASSWD:" >&2
+  echo "        sudo cp shutdown/deploy/inga-sudoers-prod /etc/sudoers.d/inga-prod-apply" >&2
+  echo "        sudo chmod 440 /etc/sudoers.d/inga-prod-apply && sudo visudo -c" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Config paths
+# ---------------------------------------------------------------------------
+REPO="${REPO:-/srv/inga-quants}"
+ALLOWLIST="${ALLOWLIST:-$REPO/shutdown/deploy/prod-allowlist.conf}"
+DENYLIST="${DENYLIST:-$REPO/shutdown/deploy/prod-denylist.conf}"
+
+if [[ ! -f "$ALLOWLIST" ]]; then
+  echo "[ERR] Allowlist not found: $ALLOWLIST" >&2; exit 1
+fi
+if [[ ! -f "$DENYLIST" ]]; then
+  echo "[ERR] Denylist not found: $DENYLIST" >&2; exit 1
+fi
+
+# Parse list: strip comments and blank lines
+_parse_list() {
+  grep -v '^\s*#' "$1" | grep -v '^\s*$' || true
+}
+
+_log "inga-prod-apply: start dry=${DRY_RUN} repo=${REPO}"
+
+# ---------------------------------------------------------------------------
+# Apply allowlist: enable + start each unit
+# ---------------------------------------------------------------------------
+_log "── allowlist: enable + start ────────────────────────────────"
+while IFS= read -r unit; do
+  [[ -z "$unit" ]] && continue
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    _dry "systemctl enable --now ${unit}"
+  else
+    if systemctl enable --now "$unit" 2>/dev/null; then
+      _log "  enabled: ${unit}"
+    else
+      _warn "  could not enable ${unit} (unit may not exist on this host yet)"
+    fi
+  fi
+done < <(_parse_list "$ALLOWLIST")
+
+# ---------------------------------------------------------------------------
+# Apply denylist: stop, disable, mask
+# ---------------------------------------------------------------------------
+_log "── denylist: disable + mask ─────────────────────────────────"
+while IFS= read -r unit; do
+  [[ -z "$unit" ]] && continue
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    _dry "systemctl disable --now ${unit} && systemctl mask ${unit}"
+  else
+    systemctl disable --now "$unit" 2>/dev/null || true
+    systemctl mask "$unit" 2>/dev/null || true
+    _log "  masked: ${unit}"
+  fi
+done < <(_parse_list "$DENYLIST")
+
+# ---------------------------------------------------------------------------
+# Reload + reset failed
+# ---------------------------------------------------------------------------
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  systemctl daemon-reload
+  systemctl reset-failed
+  _log "systemctl daemon-reload + reset-failed: OK"
+else
+  _dry "systemctl daemon-reload && systemctl reset-failed"
+fi
+
+# ---------------------------------------------------------------------------
+# Verify: no allowlisted unit in failed state
+# ---------------------------------------------------------------------------
+_log "── verify: checking allowlisted units ───────────────────────"
+failed_units=()
+while IFS= read -r unit; do
+  [[ -z "$unit" ]] && continue
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    _dry "systemctl is-failed ${unit}"
+    continue
+  fi
+  if systemctl is-failed --quiet "$unit" 2>/dev/null; then
+    failed_units+=("$unit")
+    _warn "  FAILED: ${unit}"
+  else
+    state="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+    _log "  OK (${state}): ${unit}"
+  fi
+done < <(_parse_list "$ALLOWLIST")
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  _log "inga-prod-apply: dry-run complete"
+  exit 0
+fi
+
+if [[ ${#failed_units[@]} -gt 0 ]]; then
+  echo "" >&2
+  echo "[ERR] The following production units are in failed state:" >&2
+  for u in "${failed_units[@]}"; do
+    echo "  ${u}" >&2
+    systemctl --no-pager -l status "$u" 2>/dev/null | head -20 >&2 || true
+    echo "" >&2
+  done
+  echo "Fix the unit(s) above, then re-run: sudo -n inga-prod-apply" >&2
+  exit 1
+fi
+
+_log "inga-prod-apply: OK — all production units clean"
+systemctl --failed --no-pager | head -20 || true

@@ -1,0 +1,187 @@
+"""CI lint tests for the production profile.
+
+These tests verify structural integrity of the production allowlist/denylist
+and the inga-prod-apply script — without requiring root or a running systemd.
+
+Checks:
+  - Config files exist and are parseable
+  - No unit appears in both allowlist and denylist
+  - All unit names look like valid systemd names
+  - inga-prod-apply passes bash -n
+  - inga-prod-apply --dry-run exits 0 without root
+  - docs/PRODUCTION.md exists and references allowlisted units
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+_REPO = Path(__file__).parent.parent
+_DEPLOY_DIR = _REPO / "shutdown" / "deploy"
+_ALLOWLIST = _DEPLOY_DIR / "prod-allowlist.conf"
+_DENYLIST = _DEPLOY_DIR / "prod-denylist.conf"
+_PROD_APPLY = _DEPLOY_DIR / "inga-prod-apply"
+_PRODUCTION_MD = _REPO / "docs" / "PRODUCTION.md"
+
+# Valid systemd unit name pattern (covers .service, .timer, .socket, .target)
+_UNIT_PATTERN = re.compile(r'^[\w@.:\-]+\.(service|timer|socket|target|mount|path)$')
+
+
+def _parse_conf(path: Path) -> list[str]:
+    """Return non-comment, non-blank lines from a conf file."""
+    lines = []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            lines.append(stripped)
+    return lines
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config file structure
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestConfigFiles:
+    def test_allowlist_exists(self):
+        assert _ALLOWLIST.exists(), f"Missing: {_ALLOWLIST}"
+
+    def test_denylist_exists(self):
+        assert _DENYLIST.exists(), f"Missing: {_DENYLIST}"
+
+    def test_allowlist_has_entries(self):
+        """Allowlist must have at least one production unit."""
+        entries = _parse_conf(_ALLOWLIST)
+        assert len(entries) >= 1, "prod-allowlist.conf has no entries — add at least one unit"
+
+    def test_allowlist_valid_unit_names(self):
+        """Every allowlist entry must look like a valid systemd unit name."""
+        bad = [e for e in _parse_conf(_ALLOWLIST) if not _UNIT_PATTERN.match(e)]
+        assert not bad, f"Invalid unit names in allowlist: {bad}"
+
+    def test_denylist_valid_unit_names(self):
+        """Every denylist entry must look like a valid systemd unit name."""
+        bad = [e for e in _parse_conf(_DENYLIST) if not _UNIT_PATTERN.match(e)]
+        assert not bad, f"Invalid unit names in denylist: {bad}"
+
+    def test_no_overlap_allowlist_denylist(self):
+        """A unit must not appear in both allowlist and denylist."""
+        allow = set(_parse_conf(_ALLOWLIST))
+        deny = set(_parse_conf(_DENYLIST))
+        overlap = allow & deny
+        assert not overlap, (
+            f"Units in both allowlist and denylist (ambiguous): {overlap}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# inga-prod-apply script
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestProdApplyScript:
+    def test_script_exists(self):
+        assert _PROD_APPLY.exists(), f"Missing: {_PROD_APPLY}"
+
+    def test_bash_syntax(self):
+        """bash -n must pass."""
+        result = subprocess.run(["bash", "-n", str(_PROD_APPLY)], capture_output=True, text=True)
+        assert result.returncode == 0, f"bash -n failed:\n{result.stderr}"
+
+    def test_no_bare_read_r(self):
+        """No bare 'read -r' outside PAUSE guard (would block without TTY)."""
+        text = _PROD_APPLY.read_text()
+        lines = text.splitlines()
+        violations = []
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "while" in stripped and "read -r" in stripped:
+                continue
+            if "read -r" in stripped:
+                context = "\n".join(lines[max(0, i-10):i])
+                if "PAUSE" not in context:
+                    violations.append(f"  line {i}: {line.rstrip()}")
+        assert not violations, (
+            f"Bare 'read -r' in inga-prod-apply:\n" + "\n".join(violations)
+        )
+
+    def test_dry_run_exits_0_without_root(self):
+        """--dry-run works without root (shows plan, no systemctl calls)."""
+        import os
+        if os.getuid() == 0:
+            pytest.skip("Running as root — non-root path not reachable")
+        result = subprocess.run(
+            ["bash", str(_PROD_APPLY), "--dry-run"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, f"--dry-run failed:\n{result.stdout}\n{result.stderr}"
+        assert "[DRY]" in result.stdout
+
+    def test_dry_run_mentions_allowlist_units(self):
+        """--dry-run output references every allowlisted unit."""
+        import os
+        if os.getuid() == 0:
+            pytest.skip("Running as root — non-root path not reachable")
+        result = subprocess.run(
+            ["bash", str(_PROD_APPLY), "--dry-run"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        for unit in _parse_conf(_ALLOWLIST):
+            assert unit in result.stdout, (
+                f"Unit '{unit}' not mentioned in --dry-run output"
+            )
+
+    def test_not_root_normal_mode_exits_1(self):
+        """Normal mode exits 1 immediately when not root (no hanging)."""
+        import os
+        if os.getuid() == 0:
+            pytest.skip("Running as root — non-root exit path not reachable")
+        result = subprocess.run(
+            ["bash", str(_PROD_APPLY)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 1
+        combined = result.stdout + result.stderr
+        assert "root" in combined.lower()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# docs/PRODUCTION.md consistency
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestProductionMd:
+    def test_production_md_exists(self):
+        assert _PRODUCTION_MD.exists(), f"Missing: {_PRODUCTION_MD}"
+
+    def test_production_md_mentions_allowlist_units(self):
+        """PRODUCTION.md must mention every unit in the allowlist."""
+        text = _PRODUCTION_MD.read_text()
+        missing = [u for u in _parse_conf(_ALLOWLIST) if u not in text]
+        assert not missing, (
+            f"Units in prod-allowlist.conf not mentioned in PRODUCTION.md: {missing}\n"
+            "Update docs/PRODUCTION.md to reference these units."
+        )
+
+    def test_production_md_has_key_sections(self):
+        """PRODUCTION.md must contain the key section headings."""
+        text = _PRODUCTION_MD.read_text()
+        required = [
+            "allowlist",
+            "denylist",
+            "SKIP",
+            "sudo -n inga-prod-apply",
+        ]
+        missing = [r for r in required if r not in text]
+        assert not missing, f"Missing content in PRODUCTION.md: {missing}"

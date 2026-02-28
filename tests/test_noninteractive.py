@@ -25,6 +25,7 @@ _UNIVERSE = _SCRIPTS_DIR / "inga_universe300_build.sh"
 _WRAPPER = _SCRIPTS_DIR / "inga_weekly_digest_wrapper.sh"
 _AUTOMERGE = _REPO / "bin" / "pr_automerge.sh"
 _DEPLOY = _REPO / "shutdown" / "deploy" / "inga-deploy-shutdown"
+_PROD_APPLY = _REPO / "shutdown" / "deploy" / "inga-prod-apply"
 
 # Safe env: no keys, no TTY
 _BASE_ENV = {
@@ -65,6 +66,7 @@ SCRIPTS_TO_CHECK = [
     _WRAPPER,
     _AUTOMERGE,
     _DEPLOY,
+    _PROD_APPLY,
 ]
 
 
@@ -197,3 +199,19 @@ class TestNoTtyExecution:
             pytest.skip("Running as root — non-root path not reachable")
         result = _run_notty(["bash", str(_DEPLOY), "--dry-run"], timeout=10)
         assert result.returncode == 1
+
+    def test_prod_apply_notty_not_root_exits_1(self):
+        """inga-prod-apply exits 1 without prompting when not root (normal mode)."""
+        if os.getuid() == 0:
+            pytest.skip("Running as root — non-root exit path not reachable")
+        result = _run_notty(["bash", str(_PROD_APPLY)], timeout=10)
+        assert result.returncode == 1
+        assert "root" in result.stderr.lower() or "root" in result.stdout.lower()
+
+    def test_prod_apply_notty_dry_run_no_root_exits_0(self):
+        """inga-prod-apply --dry-run exits 0 without root (shows plan only)."""
+        if os.getuid() == 0:
+            pytest.skip("Running as root — non-root path not reachable")
+        result = _run_notty(["bash", str(_PROD_APPLY), "--dry-run"], timeout=15)
+        assert result.returncode == 0, f"dry-run failed:\n{result.stdout}\n{result.stderr}"
+        assert "[DRY]" in result.stdout
