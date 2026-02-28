@@ -3,8 +3,8 @@
 # Deploys SHUTDOWN scripts from the inga-quants repo to /srv/inga/SHUTDOWN/bin/
 # and installs the systemd drop-in for inga-weekly-digest.
 #
-# Designed to run as root via NOPASSWD sudo so Claude Code and VSCode tasks
-# can deploy without interactive password prompts.
+# Idempotent: safe to run multiple times. Never prompts for input.
+# Designed to run via NOPASSWD sudo (see shutdown/deploy/inga-sudoers-deploy).
 #
 # One-time setup (as root):
 #   sudo cp shutdown/deploy/inga-deploy-shutdown /usr/local/sbin/
@@ -14,21 +14,48 @@
 #   sudo chmod 440 /etc/sudoers.d/inga-deploy-shutdown
 #   sudo visudo -c   # validate
 #
-# After setup, deploy with:
-#   sudo inga-deploy-shutdown
+# Usage (no password required after setup):
+#   sudo -n inga-deploy-shutdown
+#   sudo -n inga-deploy-shutdown --dry-run
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+DRY_RUN=0
+for arg in "$@"; do [[ "$arg" == "--dry-run" ]] && DRY_RUN=1; done
+
+# ---------------------------------------------------------------------------
+# Root check — must run as root (via sudo -n); never prompt for password
+# ---------------------------------------------------------------------------
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "[ERR] inga-deploy-shutdown must run as root." >&2
+  echo "      Fix: sudo -n inga-deploy-shutdown" >&2
+  echo "      If you get 'sudo: a password is required', set up NOPASSWD:" >&2
+  echo "        sudo cp shutdown/deploy/inga-sudoers-deploy /etc/sudoers.d/inga-deploy-shutdown" >&2
+  echo "        sudo chmod 440 /etc/sudoers.d/inga-deploy-shutdown && sudo visudo -c" >&2
+  exit 1
+fi
 
 REPO="${REPO:-/srv/inga-quants}"
 SRC="$REPO/shutdown"
 DEST=/srv/inga/SHUTDOWN/bin
 SYSTEMD_DROP=/etc/systemd/system/inga-weekly-digest.service.d
 
-_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+_ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _log() { echo "$(_ts) $*"; }
+_dry() { echo "$(_ts) [DRY] $*"; }
 
-_log "inga-deploy-shutdown: start"
+_log "inga-deploy-shutdown: start repo=${REPO} dry=${DRY_RUN}"
 
-# ── scripts ──────────────────────────────────────────────────────────────────
+# Ensure destination exists (idempotent)
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  mkdir -p "$DEST"
+else
+  _dry "mkdir -p $DEST"
+fi
+
+# ── bash scripts ─────────────────────────────────────────────────────────────
 for script in \
   inga_market_quotes_ingest_jq300.sh \
   inga_universe300_build.sh \
@@ -40,17 +67,25 @@ do
     continue
   fi
   bash -n "$src_file" || { _log "ERR: syntax check failed for $script"; exit 1; }
-  cp "$src_file" "$DEST/$script"
-  chmod 750 "$DEST/$script"
-  _log "  deployed: $DEST/$script"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    cp "$src_file" "$DEST/$script"
+    chmod 750 "$DEST/$script"
+    _log "  deployed: $DEST/$script"
+  else
+    _dry "cp $src_file $DEST/$script && chmod 750"
+  fi
 done
 
 # ── notify_digest.py ─────────────────────────────────────────────────────────
 NOTIFY_SRC="$SRC/tools/notify_digest.py"
 if [[ -f "$NOTIFY_SRC" ]]; then
-  cp "$NOTIFY_SRC" "$DEST/notify_digest.py"
-  chmod 640 "$DEST/notify_digest.py"
-  _log "  deployed: $DEST/notify_digest.py"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    cp "$NOTIFY_SRC" "$DEST/notify_digest.py"
+    chmod 640 "$DEST/notify_digest.py"
+    _log "  deployed: $DEST/notify_digest.py"
+  else
+    _dry "cp $NOTIFY_SRC $DEST/notify_digest.py && chmod 640"
+  fi
 else
   _log "WARN: $NOTIFY_SRC not found — skipping notify_digest.py"
 fi
@@ -58,12 +93,23 @@ fi
 # ── systemd drop-in ──────────────────────────────────────────────────────────
 OVERRIDE_SRC="$SRC/systemd/inga-weekly-digest.service.d/skip-wrapper.conf"
 if [[ -f "$OVERRIDE_SRC" ]]; then
-  mkdir -p "$SYSTEMD_DROP"
-  cp "$OVERRIDE_SRC" "$SYSTEMD_DROP/skip-wrapper.conf"
-  _log "  deployed: $SYSTEMD_DROP/skip-wrapper.conf"
-  systemctl daemon-reload
-  systemctl reset-failed inga-weekly-digest.service 2>/dev/null || true
-  _log "  systemd daemon-reload OK"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p "$SYSTEMD_DROP"
+    cp "$OVERRIDE_SRC" "$SYSTEMD_DROP/skip-wrapper.conf"
+    _log "  deployed: $SYSTEMD_DROP/skip-wrapper.conf"
+    systemctl daemon-reload
+    systemctl reset-failed inga-weekly-digest.service 2>/dev/null || true
+    _log "  systemd daemon-reload OK"
+    # Start / restart to pick up new wrapper
+    systemctl restart inga-weekly-digest.service 2>/dev/null || \
+      systemctl start  inga-weekly-digest.service 2>/dev/null || true
+    systemctl --no-pager -l status inga-weekly-digest.service 2>/dev/null || true
+  else
+    _dry "mkdir -p $SYSTEMD_DROP"
+    _dry "cp $OVERRIDE_SRC $SYSTEMD_DROP/skip-wrapper.conf"
+    _dry "systemctl daemon-reload && systemctl reset-failed inga-weekly-digest.service"
+    _dry "systemctl restart inga-weekly-digest.service"
+  fi
 fi
 
 _log "inga-deploy-shutdown: OK"

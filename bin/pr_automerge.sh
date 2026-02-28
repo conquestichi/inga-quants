@@ -133,15 +133,18 @@ if [[ "$PAUSE" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# gh auth — auto-login with GH_TOKEN if available and not already logged in
+# gh auth — non-interactive; never starts device flow
 # ---------------------------------------------------------------------------
 if ! gh auth status >/dev/null 2>&1; then
   if [[ -n "${GH_TOKEN:-}" ]]; then
     _info "gh not authenticated; logging in with GH_TOKEN..."
     gh auth login --with-token <<< "$GH_TOKEN"
   else
-    _info "gh not authenticated; starting device flow..."
-    gh auth login -h github.com -p https --web
+    echo "[ERR]  gh is not authenticated and GH_TOKEN is not set." >&2
+    echo "       Fix with one of:" >&2
+    echo "         export GH_TOKEN=<your-token>  # then re-run" >&2
+    echo "         gh auth login                 # run interactively once" >&2
+    exit 2
   fi
 fi
 
