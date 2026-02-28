@@ -96,6 +96,10 @@ sudo cp shutdown/bin/inga_universe300_build.sh          /srv/inga/SHUTDOWN/bin/
 sudo cp shutdown/bin/inga_weekly_digest_wrapper.sh      /srv/inga/SHUTDOWN/bin/
 sudo chmod 750 /srv/inga/SHUTDOWN/bin/*.sh
 
+# notify_digest.py もデプロイ (weekly-digest が script_missing にならないために必要)
+sudo cp shutdown/tools/notify_digest.py /srv/inga/SHUTDOWN/bin/notify_digest.py
+sudo chmod 640 /srv/inga/SHUTDOWN/bin/notify_digest.py
+
 # 5. weekly-digest のシステム override (root) — inga-deploy-shutdown が自動実施
 sudo mkdir -p /etc/systemd/system/inga-weekly-digest.service.d/
 sudo cp shutdown/systemd/inga-weekly-digest.service.d/skip-wrapper.conf \
@@ -104,7 +108,8 @@ sudo systemctl daemon-reload
 sudo systemctl reset-failed inga-weekly-digest.service
 
 # 6. 動作確認
-systemctl start inga-weekly-digest.service
+sudo systemctl start inga-weekly-digest.service
+sudo systemctl --no-pager -l status inga-weekly-digest.service
 systemctl --failed | grep inga
 ```
 
