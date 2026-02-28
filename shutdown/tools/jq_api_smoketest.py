@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""
+jq_api_smoketest.py
+J-Quants API pre-flight auth verification.
+
+Reads the API key from env (JQ_API_KEY / JQUANTS_API_KEY / JQUANTS_APIKEY, in
+priority order) and makes a single lightweight GET request to verify that the
+key is valid and the API is reachable.
+
+Exit codes:
+  0  — HTTP 200 (key valid, API up)
+  2  — API key not set in any of the supported env vars
+  3  — HTTP 401 (authentication failure — key wrong or expired)
+  4  — HTTP 403 (permission / plan restriction)
+  5  — timeout or network error
+  6  — any other error (unexpected HTTP status, DNS failure, etc.)
+
+Never logs the API key value.
+"""
+
+import os
+import sys
+import urllib.error
+import urllib.request
+
+_BASE_URL = "https://api.jquants.com"
+_PATH = "/v2/equities/master"
+_CONNECT_TIMEOUT = 5
+_TOTAL_TIMEOUT = 15
+
+_URL = _BASE_URL + _PATH
+
+
+def _log(msg: str) -> None:
+    import datetime
+
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"{ts} [smoketest] {msg}", flush=True)
+
+
+def _truncate(text: str, max_len: int = 200) -> str:
+    return text if len(text) <= max_len else text[:max_len] + "…"
+
+
+def main() -> int:
+    # ── key resolution (priority order) ────────────────────────────────────
+    api_key = (
+        os.environ.get("JQ_API_KEY")
+        or os.environ.get("JQUANTS_API_KEY")
+        or os.environ.get("JQUANTS_APIKEY")
+        or ""
+    )
+
+    if not api_key:
+        _log("key_missing: JQ_API_KEY / JQUANTS_API_KEY / JQUANTS_APIKEY not set in env")
+        return 2
+
+    _log(f"probe url={_URL}")
+
+    req = urllib.request.Request(
+        _URL,
+        headers={"x-api-key": api_key},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=_TOTAL_TIMEOUT) as resp:
+            http_status = resp.status
+            body_bytes = resp.read(512)
+    except urllib.error.HTTPError as exc:
+        http_status = exc.code
+        try:
+            body_bytes = exc.read(512)
+        except Exception:
+            body_bytes = b""
+    except TimeoutError as exc:
+        _log(f"timeout: {exc}")
+        return 5
+    except OSError as exc:
+        # Covers socket.timeout (Python < 3.11), connection refused, DNS errors
+        msg = str(exc)
+        if "timed out" in msg.lower() or "timeout" in msg.lower():
+            _log(f"timeout: {exc}")
+            return 5
+        _log(f"network_error: {exc}")
+        return 5
+    except Exception as exc:
+        _log(f"unexpected_error: {type(exc).__name__}: {exc}")
+        return 6
+
+    try:
+        body_text = body_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        body_text = repr(body_bytes)
+
+    _log(f"http_status={http_status} response={_truncate(body_text)}")
+
+    if http_status == 200:
+        _log("OK: API key valid")
+        return 0
+    if http_status == 401:
+        _log("auth_failure: HTTP 401 — key wrong or expired")
+        return 3
+    if http_status == 403:
+        _log("permission_denied: HTTP 403 — plan restriction or access denied")
+        return 4
+    _log(f"unexpected_status: HTTP {http_status}")
+    return 6
+
+
+if __name__ == "__main__":
+    sys.exit(main())
