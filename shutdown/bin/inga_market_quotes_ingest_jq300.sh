@@ -117,6 +117,7 @@ first_code="$(grep -E '^[0-9]{4,5}$' "$U300" | head -n 1 || true)"
 pick_date=""
 probe_http=""
 probe_url=""
+probe_auth_errors=0   # count 401/403 responses (auth failure indicator)
 
 for back in 0 1 2 3 4 5; do
   probe_d="$(date -d "today - ${back} day" +%Y%m%d)"
@@ -141,6 +142,11 @@ for back in 0 1 2 3 4 5; do
 
   _log "DBG: probe back=${back} http=${probe_http:-???}"
 
+  # Count auth errors for better diagnostics at the end
+  if [[ "${probe_http:-}" == "401" || "${probe_http:-}" == "403" ]]; then
+    probe_auth_errors=$((probe_auth_errors + 1))
+  fi
+
   if [[ "${probe_http:-}" == "200" ]]; then
     n="$(jq -r '(.data // []) | length' "$PROBE_BODY" 2>/dev/null || echo 0)"
     if [[ "${n:-0}" != "0" ]]; then
@@ -157,6 +163,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 if [[ -z "$pick_date" ]]; then
+  if [[ "$probe_auth_errors" -ge 3 ]]; then
+    _log_fail "API authentication failed: ${probe_auth_errors}/6 probes returned HTTP ${probe_http:-N/A}. Verify JQ_API_KEY is valid and has not expired."
+  fi
   _log_fail "could not determine latest business date (probed back 5 days) | last_http=${probe_http:-N/A} url=${probe_url:-N/A}"
 fi
 

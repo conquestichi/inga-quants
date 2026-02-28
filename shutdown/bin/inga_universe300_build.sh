@@ -26,11 +26,13 @@ for arg in "$@"; do [[ "$arg" == "--dry-run" ]] && DRY_RUN=1; done
 _ts()       { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _log()      { echo "$(_ts) $*"; }
 _log_skip() { _log "[SKIP] reason=${1} ${2:-}"; exit 0; }
+_log_fail() { _log "[FAIL] ${1}" >&2; exit 1; }
 
 # ─── paths (no I/O — SKIP checks come first) ─────────────────────────────────
-BASE=/srv/inga/SHUTDOWN
+# BASE/OUT are env-overridable for testing without write access to /srv/inga.
+BASE="${BASE:-/srv/inga/SHUTDOWN}"
 ENV="${BASE}/conf/inga_signals.env"
-OUT="${BASE}/conf/universe300.txt"
+OUT="${OUT:-${BASE}/conf/universe300.txt}"
 
 # ─── env / config (soft-fail: if file unreadable, env vars may stay unset) ───
 if [[ -f "$ENV" ]]; then

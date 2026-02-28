@@ -228,3 +228,18 @@ class TestNoTtyExecution:
         assert result.returncode == 1
         combined = result.stdout + result.stderr
         assert "root" in combined.lower()
+
+    def test_prod_status_notty_default_exits_0(self, tmp_path):
+        """inga-prod-status (no --check) exits 0 without TTY regardless of unit state."""
+        # Use a custom allowlist with a definitely-missing timer to stress-test
+        # the fallback paths. Default mode must never exit 1.
+        allowlist = tmp_path / "allowlist.conf"
+        allowlist.write_text("inga-definitely-does-not-exist.timer\n")
+        result = _run_notty(
+            ["bash", str(_PROD_STATUS)],
+            env={**_BASE_ENV, "ALLOWLIST": str(allowlist)},
+            timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"inga-prod-status default mode must exit 0:\n{result.stdout}\n{result.stderr}"
+        )
