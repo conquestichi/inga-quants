@@ -12,12 +12,12 @@ import numpy as np
 import pandas as pd
 
 from inga_quant.features.build_features import build_features
-from inga_quant.pipeline.gates import AllGatesResult, run_all_gates
+from inga_quant.pipeline.gates import AllGatesResult, GateResult, run_all_gates
 from inga_quant.pipeline.ingest import DataLoader, DemoLoader
 from inga_quant.pipeline.model import ModelConfig, TrainResult, add_forward_return, predict, train_model
 from inga_quant.pipeline.notify import build_slack_payload, send_slack
 from inga_quant.pipeline.output import write_outputs
-from inga_quant.pipeline.trade_date import next_trade_date
+from inga_quant.pipeline.trade_date import is_business_day, next_trade_date
 from inga_quant.pipeline.watchlist import WatchlistConfig, WatchlistEntry, build_watchlist
 from inga_quant.utils.config import load_config, load_signal_features
 from inga_quant.utils.hash import code_hash, inputs_digest
@@ -30,6 +30,69 @@ def _make_run_id(as_of: date) -> str:
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     short = uuid.uuid4().hex[:8]
     return f"{ts}-{short}"
+
+
+def _write_no_trade(
+    reason: str,
+    as_of: date,
+    trade_date: date,
+    run_id: str,
+    out_dir: Path,
+    cfg: dict,
+    lang: str,
+) -> Path:
+    """Write NO_TRADE outputs for an early-exit condition and return out_dir.
+
+    Used when as_of is a non-trading day (reason='non_trading_day')
+    or when no bars data is available (reason='no_data').
+    """
+    gate_result = AllGatesResult(
+        all_passed=False,
+        gates={reason: GateResult(name=reason, passed=False, reason=reason)},
+        rejection_reasons=[reason],
+        missing_rate=0.0,
+        n_eligible=0,
+    )
+    td_str = trade_date.strftime("%Y-%m-%d")
+    generated_at_jst = datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds")
+    manifest = {
+        "run_id": run_id,
+        "code_hash": code_hash(),
+        "inputs_digest": "n/a",
+        "as_of": str(as_of),
+        "data_asof": str(as_of),
+        "trade_date": td_str,
+        "generated_at_jst": generated_at_jst,
+        "params": {
+            "model": cfg.get("model", {}).get("type", "Ridge"),
+            "alpha": float(cfg.get("model", {}).get("alpha", 1.0)),
+            "target": "forward_return_5d",
+            "minute_cache_days": int(cfg.get("cache", {}).get("minute_cache_days", 20)),
+        },
+    }
+    write_outputs(
+        out_dir=out_dir,
+        trade_date=trade_date,
+        run_id=run_id,
+        gate_result=gate_result,
+        watchlist=[],
+        manifest=manifest,
+        wf_ic=0.0,
+        lang=lang,
+    )
+    slack_payload = build_slack_payload(
+        trade_date=td_str,
+        run_id=run_id,
+        action="NO_TRADE",
+        wf_ic=0.0,
+        n_eligible=0,
+        no_trade_reasons=[reason],
+        top3=[],
+        lang=lang,
+    )
+    send_slack(payload=slack_payload, fallback_path=out_dir / "slack_payload.json")
+    logger.info("Early exit NO_TRADE: reason=%s out_dir=%s", reason, out_dir)
+    return out_dir
 
 
 def run_pipeline(
@@ -66,6 +129,13 @@ def run_pipeline(
     logger.info("=== inga-quant run start: run_id=%s as_of=%s trade_date=%s ===", run_id, as_of, td_str)
 
     # ------------------------------------------------------------------
+    # Market calendar guard
+    # ------------------------------------------------------------------
+    if not is_business_day(as_of):
+        logger.info("Non-trading day: as_of=%s — writing NO_TRADE and returning", as_of)
+        return _write_no_trade("non_trading_day", as_of, trade_date, run_id, out_dir, cfg, lang)
+
+    # ------------------------------------------------------------------
     # Ingest
     # ------------------------------------------------------------------
     model_cfg_dict = cfg.get("model", {})
@@ -75,6 +145,13 @@ def run_pipeline(
     start_date = date.fromordinal(as_of.toordinal() - train_days)
     bars = loader.fetch_daily(start_date=start_date, end_date=as_of)
     logger.info("Loaded %d rows of bars (%d tickers)", len(bars), bars["ticker"].nunique())
+
+    # ------------------------------------------------------------------
+    # Empty bars guard
+    # ------------------------------------------------------------------
+    if len(bars) == 0:
+        logger.info("No bars data: as_of=%s — writing NO_TRADE and returning", as_of)
+        return _write_no_trade("no_data", as_of, trade_date, run_id, out_dir, cfg, lang)
 
     # ------------------------------------------------------------------
     # Equities master (company names) — non-fatal if unavailable
