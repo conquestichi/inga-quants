@@ -87,41 +87,56 @@ Add retired units here instead of leaving them in a failed state.
 
 ## Deployment Procedure
 
-### First time (one-time root setup)
+### First time — one-time root bootstrap (password required once)
 
-```bash
-# 1. Install deploy scripts
-sudo cp shutdown/deploy/inga-deploy-shutdown /usr/local/sbin/
-sudo chown root:root /usr/local/sbin/inga-deploy-shutdown
-sudo chmod 755 /usr/local/sbin/inga-deploy-shutdown
+Run this single command from PowerShell (or any SSH client).
+After this, **all subsequent operations are password-free**.
 
-sudo cp shutdown/deploy/inga-prod-apply /usr/local/sbin/
-sudo chown root:root /usr/local/sbin/inga-prod-apply
-sudo chmod 755 /usr/local/sbin/inga-prod-apply
-
-# 2. Install sudoers (NOPASSWD for inga user)
-sudo cp shutdown/deploy/inga-sudoers-deploy /etc/sudoers.d/inga-deploy-shutdown
-sudo chmod 440 /etc/sudoers.d/inga-deploy-shutdown
-
-sudo cp shutdown/deploy/inga-sudoers-prod /etc/sudoers.d/inga-prod-apply
-sudo chmod 440 /etc/sudoers.d/inga-prod-apply
-
-sudo visudo -c   # validate; must print "parsed OK"
+```powershell
+# PowerShell — paste once, enter your sudo password when prompted
+ssh -tt inga@YOUR_VPS_HOST "sudo bash /srv/inga-quants/shutdown/deploy/inga-prod-bootstrap"
 ```
 
-### Every deployment (non-interactive, password-free)
+What the bootstrap script does (idempotent, safe to re-run):
+1. Installs `inga-deploy-shutdown` + `inga-prod-apply` to `/usr/local/sbin/` (root:root 755)
+2. Creates `/usr/local/bin/` symlinks (symlink-tolerance for sudo PATH variations)
+3. Installs sudoers fragments with NOPASSWD for the `inga` user (both sbin + bin paths)
+4. Validates sudoers syntax with `visudo -cf`
+5. Self-tests NOPASSWD grants via `sudo -l -U inga`
 
-```bash
-# Deploy scripts + systemd drop-ins from repo
-sudo -n inga-deploy-shutdown
+### Every deployment — password-free
 
-# Apply production profile (enable allowlist, mask denylist, verify --failed is clean)
-sudo -n inga-prod-apply
+```powershell
+# PowerShell — no password prompt
+
+# Step 1: Deploy scripts + systemd drop-ins from repo
+ssh inga@YOUR_VPS_HOST "sudo -n inga-deploy-shutdown"
+
+# Step 2: Apply production profile (enable allowlist, mask denylist, verify --failed is clean)
+ssh inga@YOUR_VPS_HOST "sudo -n inga-prod-apply"
+
+# Combined (stops on first failure):
+ssh inga@YOUR_VPS_HOST "sudo -n inga-deploy-shutdown && sudo -n inga-prod-apply"
+```
+
+### Dry-run (preview without changes)
+
+```powershell
+# PowerShell — shows what would happen, exits 0, no root required
+ssh inga@YOUR_VPS_HOST "bash /srv/inga-quants/shutdown/deploy/inga-deploy-shutdown --dry-run"
+ssh inga@YOUR_VPS_HOST "bash /srv/inga-quants/shutdown/deploy/inga-prod-apply --dry-run"
 ```
 
 ### Verify production state
 
+```powershell
+# PowerShell
+ssh inga@YOUR_VPS_HOST "systemctl --failed --no-pager"
+ssh inga@YOUR_VPS_HOST "sudo -n inga-prod-apply && echo 'production OK'"
+```
+
 ```bash
+# On VPS directly
 # Check for any failed units
 systemctl --failed --no-pager
 
@@ -132,6 +147,27 @@ systemctl status inga-market-quotes-ingest.service inga-universe300-build.servic
 JQ_API_KEY="" bash /srv/inga/SHUTDOWN/bin/inga_market_quotes_ingest_jq300.sh
 # Expected: [SKIP] reason=api_key_missing   exit 0
 ```
+
+### Troubleshooting: `sudo -n` fails with "password is required"
+
+The sudoers fragment is not installed. Run the bootstrap:
+
+```powershell
+ssh -tt inga@YOUR_VPS_HOST "sudo bash /srv/inga-quants/shutdown/deploy/inga-prod-bootstrap"
+```
+
+Then verify:
+```bash
+# On VPS
+sudo -l -U inga | grep -E 'inga-(deploy-shutdown|prod-apply)'
+```
+Expected output: two NOPASSWD lines, one for `/usr/local/sbin/`, one for `/usr/local/bin/`.
+
+### Troubleshooting: `sudo -n inga-prod-apply: command not found`
+
+The script is not installed to a directory in sudo's secure_path. The bootstrap
+installs to `/usr/local/sbin/` and `/usr/local/bin/` — both are in the default
+secure_path. Re-run the bootstrap to fix.
 
 ---
 

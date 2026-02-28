@@ -24,6 +24,9 @@ _DEPLOY_DIR = _REPO / "shutdown" / "deploy"
 _ALLOWLIST = _DEPLOY_DIR / "prod-allowlist.conf"
 _DENYLIST = _DEPLOY_DIR / "prod-denylist.conf"
 _PROD_APPLY = _DEPLOY_DIR / "inga-prod-apply"
+_BOOTSTRAP = _DEPLOY_DIR / "inga-prod-bootstrap"
+_SUDOERS_PROD = _DEPLOY_DIR / "inga-sudoers-prod"
+_SUDOERS_DEPLOY = _DEPLOY_DIR / "inga-sudoers-deploy"
 _PRODUCTION_MD = _REPO / "docs" / "PRODUCTION.md"
 
 # Valid systemd unit name pattern (covers .service, .timer, .socket, .target)
@@ -185,3 +188,127 @@ class TestProductionMd:
         ]
         missing = [r for r in required if r not in text]
         assert not missing, f"Missing content in PRODUCTION.md: {missing}"
+
+    def test_production_md_has_bootstrap_powershell(self):
+        """PRODUCTION.md must include PowerShell bootstrap and operational commands."""
+        text = _PRODUCTION_MD.read_text()
+        required = [
+            "inga-prod-bootstrap",
+            "sudo -n inga-deploy-shutdown",
+            "sudo -n inga-prod-apply",
+        ]
+        missing = [r for r in required if r not in text]
+        assert not missing, f"Missing PowerShell/bootstrap content in PRODUCTION.md: {missing}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# sudoers dual-path coverage
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSudoersDualPath:
+    def test_sudoers_prod_exists(self):
+        assert _SUDOERS_PROD.exists(), f"Missing: {_SUDOERS_PROD}"
+
+    def test_sudoers_deploy_exists(self):
+        assert _SUDOERS_DEPLOY.exists(), f"Missing: {_SUDOERS_DEPLOY}"
+
+    def test_sudoers_prod_covers_sbin(self):
+        """/usr/local/sbin/inga-prod-apply must be in sudoers-prod."""
+        text = _SUDOERS_PROD.read_text()
+        assert "/usr/local/sbin/inga-prod-apply" in text, (
+            "inga-sudoers-prod missing /usr/local/sbin/inga-prod-apply"
+        )
+
+    def test_sudoers_prod_covers_bin(self):
+        """/usr/local/bin/inga-prod-apply must be in sudoers-prod (symlink-tolerance)."""
+        text = _SUDOERS_PROD.read_text()
+        assert "/usr/local/bin/inga-prod-apply" in text, (
+            "inga-sudoers-prod missing /usr/local/bin/inga-prod-apply — "
+            "add for symlink-tolerance when sudo PATH resolves bin before sbin"
+        )
+
+    def test_sudoers_deploy_covers_sbin(self):
+        """/usr/local/sbin/inga-deploy-shutdown must be in sudoers-deploy."""
+        text = _SUDOERS_DEPLOY.read_text()
+        assert "/usr/local/sbin/inga-deploy-shutdown" in text, (
+            "inga-sudoers-deploy missing /usr/local/sbin/inga-deploy-shutdown"
+        )
+
+    def test_sudoers_deploy_covers_bin(self):
+        """/usr/local/bin/inga-deploy-shutdown must be in sudoers-deploy (symlink-tolerance)."""
+        text = _SUDOERS_DEPLOY.read_text()
+        assert "/usr/local/bin/inga-deploy-shutdown" in text, (
+            "inga-sudoers-deploy missing /usr/local/bin/inga-deploy-shutdown — "
+            "add for symlink-tolerance when sudo PATH resolves bin before sbin"
+        )
+
+    def test_sudoers_prod_nopasswd_both_paths(self):
+        """Both NOPASSWD lines must be present and not commented out."""
+        lines = [
+            l.strip() for l in _SUDOERS_PROD.read_text().splitlines()
+            if l.strip() and not l.strip().startswith("#")
+        ]
+        sbin = any("/usr/local/sbin/inga-prod-apply" in l and "NOPASSWD" in l for l in lines)
+        binp = any("/usr/local/bin/inga-prod-apply" in l and "NOPASSWD" in l for l in lines)
+        assert sbin, "inga-sudoers-prod: no active NOPASSWD line for /usr/local/sbin/inga-prod-apply"
+        assert binp, "inga-sudoers-prod: no active NOPASSWD line for /usr/local/bin/inga-prod-apply"
+
+    def test_sudoers_deploy_nopasswd_both_paths(self):
+        """Both NOPASSWD lines must be present and not commented out."""
+        lines = [
+            l.strip() for l in _SUDOERS_DEPLOY.read_text().splitlines()
+            if l.strip() and not l.strip().startswith("#")
+        ]
+        sbin = any("/usr/local/sbin/inga-deploy-shutdown" in l and "NOPASSWD" in l for l in lines)
+        binp = any("/usr/local/bin/inga-deploy-shutdown" in l and "NOPASSWD" in l for l in lines)
+        assert sbin, "inga-sudoers-deploy: no active NOPASSWD line for /usr/local/sbin/inga-deploy-shutdown"
+        assert binp, "inga-sudoers-deploy: no active NOPASSWD line for /usr/local/bin/inga-deploy-shutdown"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# inga-prod-bootstrap script
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestProdBootstrap:
+    def test_bootstrap_exists(self):
+        assert _BOOTSTRAP.exists(), f"Missing: {_BOOTSTRAP}"
+
+    def test_bootstrap_bash_syntax(self):
+        """bash -n must pass."""
+        result = subprocess.run(
+            ["bash", "-n", str(_BOOTSTRAP)], capture_output=True, text=True
+        )
+        assert result.returncode == 0, f"bash -n failed:\n{result.stderr}"
+
+    def test_bootstrap_not_root_exits_1(self):
+        """Bootstrap exits 1 immediately when not root."""
+        import os
+        if os.getuid() == 0:
+            pytest.skip("Running as root — non-root exit path not reachable")
+        result = subprocess.run(
+            ["bash", str(_BOOTSTRAP)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 1
+        combined = result.stdout + result.stderr
+        assert "root" in combined.lower()
+
+    def test_bootstrap_installs_both_scripts(self):
+        """Bootstrap script source must reference both deploy scripts."""
+        text = _BOOTSTRAP.read_text()
+        assert "inga-deploy-shutdown" in text, "Bootstrap doesn't reference inga-deploy-shutdown"
+        assert "inga-prod-apply" in text, "Bootstrap doesn't reference inga-prod-apply"
+
+    def test_bootstrap_installs_both_sudoers(self):
+        """Bootstrap script must install both sudoers fragments."""
+        text = _BOOTSTRAP.read_text()
+        assert "inga-sudoers-deploy" in text, "Bootstrap doesn't install inga-sudoers-deploy"
+        assert "inga-sudoers-prod" in text, "Bootstrap doesn't install inga-sudoers-prod"
+
+    def test_bootstrap_references_visudo(self):
+        """Bootstrap must validate sudoers with visudo."""
+        text = _BOOTSTRAP.read_text()
+        assert "visudo" in text, "Bootstrap doesn't run visudo validation"
