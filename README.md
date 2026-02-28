@@ -31,12 +31,25 @@ bin/pr_automerge.sh fix/my-topic --pause
 bin/pr_automerge.sh fix/my-topic --dry-run
 ```
 
-**安全策**
+**安全策 / 非インタラクティブ保証**
 
 - 差分ゼロなら即 exit 0（"No commits between HEAD and main" エラーを防止）。
 - `git add -u` で tracked ファイルのみステージ（`data/`・`output/` を誤 commit しない）。
-- `GH_TOKEN` 環境変数があれば `gh auth login --with-token` を自動実行（認証で止まらない）。
-- `--pause` を指定した場合のみ Enter 待ちプロンプトを表示（旧挙動互換）。
+- `GH_TOKEN` があれば `--with-token` で自動ログイン。無い&未認証なら **exit 2 + 手順表示**（device flowに入らない）。
+- `--pause` を指定した場合のみ Enter 待ちプロンプトを表示（デフォルト: 止まらない）。
+- TTY なし（`ssh "bash -lc '...'"` / CI / PowerShell）でも完走する。
+
+## Claude 作業規約（止まる条件）
+
+Claude が作業を止めて確認するのは以下のみ：
+
+| 条件 | 理由 |
+|------|------|
+| secrets / credentials が不足して進めない | 補完不可能 |
+| 大量削除・データ消去・force push など不可逆操作 | 取り戻せない |
+| 仕様判断が2択以上で結果が大きく変わる | 方針確認が必要 |
+
+それ以外は **確認なしで PLAN→実装→テスト→PR→auto-merge→デプロイ手順提示** まで完走する。
 
 ## CI (GitHub Actions)
 
