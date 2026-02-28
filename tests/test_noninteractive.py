@@ -26,6 +26,7 @@ _WRAPPER = _SCRIPTS_DIR / "inga_weekly_digest_wrapper.sh"
 _AUTOMERGE = _REPO / "bin" / "pr_automerge.sh"
 _DEPLOY = _REPO / "shutdown" / "deploy" / "inga-deploy-shutdown"
 _PROD_APPLY = _REPO / "shutdown" / "deploy" / "inga-prod-apply"
+_PROD_STATUS = _REPO / "shutdown" / "deploy" / "inga-prod-status"
 _BOOTSTRAP = _REPO / "shutdown" / "deploy" / "inga-prod-bootstrap"
 
 # Safe env: no keys, no TTY
@@ -68,6 +69,7 @@ SCRIPTS_TO_CHECK = [
     _AUTOMERGE,
     _DEPLOY,
     _PROD_APPLY,
+    _PROD_STATUS,
     _BOOTSTRAP,
 ]
 

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# inga-prod-status
+# Quick overview of managed inga timer + service state.
+# Does NOT require root. Read-only — no systemctl start/stop.
+#
+# Usage:
+#   inga-prod-status           # full output
+#   inga-prod-status --short   # condensed (timer table only)
+set -euo pipefail
+
+SHORT=0
+for arg in "$@"; do [[ "$arg" == "--short" ]] && SHORT=1; done
+
+REPO="${REPO:-/srv/inga-quants}"
+ALLOWLIST="${REPO}/shutdown/deploy/prod-allowlist.conf"
+
+_parse_list() {
+  grep -v '^\s*#' "$1" | grep -v '^\s*$' || true
+}
+
+echo "── inga production status ────────────────────────────────────────"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Timer table (next trigger + last activation)
+# ---------------------------------------------------------------------------
+echo "Timers (next / last):"
+systemctl list-timers --all --no-pager 2>/dev/null \
+  | grep -E '^(NEXT|[A-Z].*inga-)' || \
+  echo "  (systemctl not available)"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Per-unit summary from allowlist
+# ---------------------------------------------------------------------------
+echo "Allowlist unit state:"
+if [[ ! -f "$ALLOWLIST" ]]; then
+  echo "  (allowlist not found: $ALLOWLIST)"
+else
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    if [[ "$unit" == *.timer ]]; then
+      svc="${unit%.timer}.service"
+      enabled="$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)"
+      active="$(systemctl is-active  "$unit" 2>/dev/null || echo unknown)"
+      svc_st="$(systemctl is-active  "$svc"  2>/dev/null || echo unknown)"
+      failed=""
+      systemctl is-failed --quiet "$svc" 2>/dev/null && failed=" *** FAILED ***"
+      printf "  %-42s enabled=%-10s timer=%-10s svc=%s%s\n" \
+        "$unit" "$enabled" "$active" "$svc_st" "$failed"
+    else
+      active="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+      failed=""
+      systemctl is-failed --quiet "$unit" 2>/dev/null && failed=" *** FAILED ***"
+      printf "  %-42s active=%s%s\n" "$unit" "$active" "$failed"
+    fi
+  done < <(_parse_list "$ALLOWLIST")
+fi
+echo ""
+
+if [[ "$SHORT" -eq 1 ]]; then
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Global --failed snapshot
+# ---------------------------------------------------------------------------
+echo "systemctl --failed (all units):"
+systemctl --failed --no-pager 2>/dev/null | head -30 || echo "  (systemctl not available)"

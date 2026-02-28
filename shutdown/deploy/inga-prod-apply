@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
 # /usr/local/sbin/inga-prod-apply
 # Applies the production systemd profile for inga:
-#   - enables + starts allowlisted units
+#   - enables + starts allowlisted timer units
 #   - disables + masks denylisted units
 #   - resets failed state
-#   - verifies no allowlisted unit remains in failed state
+#   - verifies each timer: is-enabled=enabled, is-active=active,
+#     and corresponding .service is not in failed state
+#   - "unknown" from is-active = unit file missing = ERROR (not OK)
 #
 # Idempotent: safe to run multiple times. Never prompts for input.
 # Designed to run via NOPASSWD sudo.
 #
-# One-time setup (as root):
-#   sudo cp shutdown/deploy/inga-prod-apply /usr/local/sbin/
-#   sudo chown root:root /usr/local/sbin/inga-prod-apply
-#   sudo chmod 755 /usr/local/sbin/inga-prod-apply
-#   sudo cp shutdown/deploy/inga-sudoers-prod /etc/sudoers.d/inga-prod-apply
-#   sudo chmod 440 /etc/sudoers.d/inga-prod-apply
-#   sudo visudo -c
+# One-time setup (automated):
+#   sudo bash /srv/inga-quants/shutdown/deploy/inga-prod-bootstrap
 #
 # Usage:
 #   sudo -n inga-prod-apply             # apply production profile
@@ -39,9 +36,8 @@ _dry() { echo "$(_ts) [DRY]  $*"; }
 if [[ "$DRY_RUN" -eq 0 && "$(id -u)" -ne 0 ]]; then
   echo "[ERR] inga-prod-apply must run as root." >&2
   echo "      Fix: sudo -n inga-prod-apply" >&2
-  echo "      If you get 'sudo: a password is required', set up NOPASSWD:" >&2
-  echo "        sudo cp shutdown/deploy/inga-sudoers-prod /etc/sudoers.d/inga-prod-apply" >&2
-  echo "        sudo chmod 440 /etc/sudoers.d/inga-prod-apply && sudo visudo -c" >&2
+  echo "      If you get 'sudo: a password is required', run the bootstrap:" >&2
+  echo "        sudo bash /srv/inga-quants/shutdown/deploy/inga-prod-bootstrap" >&2
   exit 1
 fi
 
@@ -67,7 +63,7 @@ _parse_list() {
 _log "inga-prod-apply: start dry=${DRY_RUN} repo=${REPO}"
 
 # ---------------------------------------------------------------------------
-# Apply allowlist: enable + start each unit
+# Apply allowlist: enable + start each timer unit
 # ---------------------------------------------------------------------------
 _log "── allowlist: enable + start ────────────────────────────────"
 while IFS= read -r unit; do
@@ -78,7 +74,7 @@ while IFS= read -r unit; do
     if systemctl enable --now "$unit" 2>/dev/null; then
       _log "  enabled: ${unit}"
     else
-      _warn "  could not enable ${unit} (unit may not exist on this host yet)"
+      _warn "  could not enable ${unit} (unit file may not exist on this host yet)"
     fi
   fi
 done < <(_parse_list "$ALLOWLIST")
@@ -110,22 +106,69 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Verify: no allowlisted unit in failed state
+# Verify: timer is-enabled + is-active; corresponding service not failed
+# "unknown" from is-active = unit file missing on this host = ERROR
 # ---------------------------------------------------------------------------
 _log "── verify: checking allowlisted units ───────────────────────"
-failed_units=()
+verify_errors=()
 while IFS= read -r unit; do
   [[ -z "$unit" ]] && continue
+
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    _dry "systemctl is-failed ${unit}"
+    if [[ "$unit" == *.timer ]]; then
+      svc="${unit%.timer}.service"
+      _dry "systemctl is-enabled ${unit} (expect: enabled)"
+      _dry "systemctl is-active  ${unit} (expect: active)"
+      _dry "systemctl is-failed  ${svc}  (expect: not failed)"
+    else
+      _dry "systemctl is-active ${unit} (expect: not unknown/failed)"
+    fi
     continue
   fi
-  if systemctl is-failed --quiet "$unit" 2>/dev/null; then
-    failed_units+=("$unit")
-    _warn "  FAILED: ${unit}"
+
+  if [[ "$unit" == *.timer ]]; then
+    svc="${unit%.timer}.service"
+
+    # 1. Timer must be enabled
+    enabled="$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)"
+    if [[ "$enabled" != "enabled" ]]; then
+      verify_errors+=("${unit}: is-enabled=${enabled} (expected: enabled)")
+      _warn "  ERR is-enabled=${enabled}: ${unit}"
+      continue
+    fi
+
+    # 2. Timer must be active (waiting for next trigger)
+    #    "unknown" means the unit file does not exist — always an error
+    active="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+    if [[ "$active" != "active" ]]; then
+      verify_errors+=("${unit}: is-active=${active} (expected: active; 'unknown' = unit file missing)")
+      _warn "  ERR is-active=${active}: ${unit}"
+      continue
+    fi
+
+    # 3. Corresponding service must not be in failed state
+    if systemctl is-failed --quiet "$svc" 2>/dev/null; then
+      verify_errors+=("${svc}: is-failed (last run of service failed)")
+      _warn "  ERR service FAILED: ${svc}"
+      systemctl --no-pager -l status "$svc" 2>/dev/null | head -10 >&2 || true
+      continue
+    fi
+
+    svc_active="$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
+    _log "  OK timer=active svc=${svc_active}: ${unit}"
+
   else
-    state="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
-    _log "  OK (${state}): ${unit}"
+    # Non-timer unit: must exist (not unknown) and not be failed
+    active="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+    if [[ "$active" == "unknown" ]]; then
+      verify_errors+=("${unit}: is-active=unknown (unit file does not exist on this host)")
+      _warn "  ERR unknown (unit missing): ${unit}"
+    elif systemctl is-failed --quiet "$unit" 2>/dev/null; then
+      verify_errors+=("${unit}: is-failed")
+      _warn "  ERR FAILED: ${unit}"
+    else
+      _log "  OK (${active}): ${unit}"
+    fi
   fi
 done < <(_parse_list "$ALLOWLIST")
 
@@ -134,17 +177,16 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-if [[ ${#failed_units[@]} -gt 0 ]]; then
+if [[ ${#verify_errors[@]} -gt 0 ]]; then
   echo "" >&2
-  echo "[ERR] The following production units are in failed state:" >&2
-  for u in "${failed_units[@]}"; do
-    echo "  ${u}" >&2
-    systemctl --no-pager -l status "$u" 2>/dev/null | head -20 >&2 || true
-    echo "" >&2
+  echo "[ERR] Production unit verification failed:" >&2
+  for e in "${verify_errors[@]}"; do
+    echo "  ${e}" >&2
   done
+  echo "" >&2
   echo "Fix the unit(s) above, then re-run: sudo -n inga-prod-apply" >&2
   exit 1
 fi
 
-_log "inga-prod-apply: OK — all production units clean"
+_log "inga-prod-apply: OK — all production units verified"
 systemctl --failed --no-pager | head -20 || true
