@@ -1,0 +1,9 @@
+# /etc/sudoers.d/inga-prod-apply
+# Allow the 'inga' user to apply the production profile without a password.
+# Only the single script is allowed — no shell escapes possible.
+#
+# Install:
+#   sudo cp shutdown/deploy/inga-sudoers-prod /etc/sudoers.d/inga-prod-apply
+#   sudo chmod 440 /etc/sudoers.d/inga-prod-apply
+#   sudo visudo -c
+inga ALL=(root) NOPASSWD: /usr/local/sbin/inga-prod-apply
