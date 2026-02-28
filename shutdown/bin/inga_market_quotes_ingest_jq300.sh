@@ -22,6 +22,11 @@ set -euo pipefail
 DRY_RUN=0
 for arg in "$@"; do [[ "$arg" == "--dry-run" ]] && DRY_RUN=1; done
 
+# AS_OF: date to evaluate for business-day check.
+# Override via env for testing: AS_OF=2026-01-01 ./script.sh
+# Default: today (JST) — used only for calendar guard, not for bar-date probe.
+AS_OF="${AS_OF:-$(date +%Y-%m-%d)}"
+
 # ─── helpers ─────────────────────────────────────────────────────────────────
 _ts()       { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _log()      { echo "$(_ts) $*"; }
@@ -29,10 +34,11 @@ _log_skip() { _log "[SKIP] reason=${1} ${2:-}"; exit 0; }
 _log_fail() { _log "[FAIL] ${1}" >&2; exit 1; }
 
 # ─── paths (no I/O — SKIP checks come first) ─────────────────────────────────
-BASE=/srv/inga/SHUTDOWN
+# BASE/STATE/U300 are env-overridable for testing without root access.
+BASE="${BASE:-/srv/inga/SHUTDOWN}"
 ENV="${BASE}/conf/inga_signals.env"
-STATE="${BASE}/state"
-U300="${BASE}/conf/universe300.txt"
+STATE="${STATE:-${BASE}/state}"
+U300="${U300:-${BASE}/conf/universe300.txt}"
 
 # ─── env / config (soft-fail: if file unreadable, env vars may stay unset) ───
 if [[ -f "$ENV" ]]; then
@@ -54,20 +60,30 @@ SOURCE_NAME="jquants"
 # ─── SKIP: non-trading day ───────────────────────────────────────────────────
 _is_jp_business_day() {
   local dow
-  dow="$(date +%u)"        # 1=Mon … 7=Sun
+  dow="$(date -d "${AS_OF}" +%u 2>/dev/null || date +%u)"  # 1=Mon … 7=Sun
   [[ "$dow" -le 5 ]] || return 1
   # JP public holiday via jpholiday.
   # Try venv python3 first (has jpholiday); fall back to system python3.
-  # If jpholiday is unavailable everywhere, fail-open (assume business day).
+  # Exit codes: 0=not a holiday, 1=JP holiday, 2=jpholiday unavailable (fail-open).
   local py3="/srv/inga-quants/.venv/bin/python3"
   [[ -x "$py3" ]] || py3="python3"
+  local py_rc=0
   "$py3" -c "
-import jpholiday
-from datetime import date
-exit(1 if jpholiday.is_holiday(date.today()) else 0)
-" 2>/dev/null || return 0
+try:
+    import jpholiday
+    from datetime import date
+    y, m, d = map(int, '${AS_OF}'.split('-'))
+    exit(1 if jpholiday.is_holiday(date(y, m, d)) else 0)
+except Exception:
+    exit(2)
+" 2>/dev/null; py_rc=$?
+  # py_rc=1 → JP public holiday → not a business day
+  # py_rc=0 → not a holiday → business day
+  # py_rc=2 → jpholiday unavailable → fail-open (assume business day)
+  [[ "$py_rc" -eq 1 ]] && return 1
+  return 0
 }
-_is_jp_business_day || _log_skip "non_trading_day" "$(date +%Y-%m-%d) is not a JP business day"
+_is_jp_business_day || _log_skip "non_trading_day" "as_of=${AS_OF} is not a JP business day"
 
 # ─── run setup (I/O: only after SKIP checks pass) ────────────────────────────
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
