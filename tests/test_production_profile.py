@@ -24,6 +24,7 @@ _DEPLOY_DIR = _REPO / "shutdown" / "deploy"
 _ALLOWLIST = _DEPLOY_DIR / "prod-allowlist.conf"
 _DENYLIST = _DEPLOY_DIR / "prod-denylist.conf"
 _PROD_APPLY = _DEPLOY_DIR / "inga-prod-apply"
+_PROD_STATUS = _DEPLOY_DIR / "inga-prod-status"
 _BOOTSTRAP = _DEPLOY_DIR / "inga-prod-bootstrap"
 _SUDOERS_PROD = _DEPLOY_DIR / "inga-sudoers-prod"
 _SUDOERS_DEPLOY = _DEPLOY_DIR / "inga-sudoers-deploy"
@@ -76,6 +77,31 @@ class TestConfigFiles:
         overlap = allow & deny
         assert not overlap, (
             f"Units in both allowlist and denylist (ambiguous): {overlap}"
+        )
+
+    def test_allowlist_has_timer_entries(self):
+        """Allowlist must contain at least one .timer unit.
+        Timers are the canonical way to schedule oneshot services.
+        """
+        timers = [e for e in _parse_conf(_ALLOWLIST) if e.endswith(".timer")]
+        assert timers, (
+            "prod-allowlist.conf has no .timer entries. "
+            "Add the timer units (e.g. inga-market-quotes-ingest.timer) — not the .service units."
+        )
+
+    def test_allowlist_no_service_when_timer_present(self):
+        """If foo.timer is in the allowlist, foo.service must NOT also be listed.
+        The service is managed by the timer; listing both is redundant and confusing.
+        """
+        entries = set(_parse_conf(_ALLOWLIST))
+        conflicts = []
+        for e in entries:
+            if e.endswith(".timer"):
+                svc = e[: -len(".timer")] + ".service"
+                if svc in entries:
+                    conflicts.append(f"{e} and {svc}")
+        assert not conflicts, (
+            f"Both timer and service in allowlist (remove the .service entry): {conflicts}"
         )
 
 
@@ -158,6 +184,82 @@ class TestProdApplyScript:
         assert result.returncode == 1
         combined = result.stdout + result.stderr
         assert "root" in combined.lower()
+
+    def test_dry_run_shows_timer_verify(self):
+        """--dry-run output includes is-enabled + is-active + is-failed checks for timers."""
+        import os
+        if os.getuid() == 0:
+            pytest.skip("Running as root — non-root path not reachable")
+        result = subprocess.run(
+            ["bash", str(_PROD_APPLY), "--dry-run"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0
+        out = result.stdout
+        assert "is-enabled" in out, "--dry-run output missing is-enabled check"
+        assert "is-active" in out, "--dry-run output missing is-active check"
+        assert "is-failed" in out, "--dry-run output missing is-failed check"
+
+    def test_prod_apply_checks_is_enabled(self):
+        """inga-prod-apply must call systemctl is-enabled (timer must be enabled)."""
+        text = _PROD_APPLY.read_text()
+        assert "is-enabled" in text, "inga-prod-apply missing is-enabled check"
+
+    def test_prod_apply_checks_is_active(self):
+        """inga-prod-apply must call systemctl is-active (timer must be active/waiting)."""
+        text = _PROD_APPLY.read_text()
+        assert "is-active" in text, "inga-prod-apply missing is-active check"
+
+    def test_prod_apply_unknown_is_error(self):
+        """'unknown' from is-active must be treated as an error, not logged as OK.
+        'unknown' means the unit file does not exist on this host.
+        """
+        text = _PROD_APPLY.read_text()
+        lines = text.splitlines()
+        violations = []
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            # Detect lines that log OK with 'unknown' in the same message
+            if "_log" in stripped and "OK" in stripped and "unknown" in stripped:
+                violations.append(f"  line {i}: {line.rstrip()}")
+        assert not violations, (
+            "Found log lines that accept 'unknown' state as OK — 'unknown' = unit missing = error:\n"
+            + "\n".join(violations)
+        )
+
+    def test_prod_apply_derives_service_from_timer(self):
+        """inga-prod-apply must derive the .service name from .timer for verification."""
+        text = _PROD_APPLY.read_text()
+        # The pattern that strips .timer and appends .service
+        assert ".timer}.service" in text or '%.timer}.service"' in text or "%.timer" in text, (
+            "inga-prod-apply does not appear to derive .service from .timer name"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# inga-prod-status script
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestProdStatusScript:
+    def test_script_exists(self):
+        assert _PROD_STATUS.exists(), f"Missing: {_PROD_STATUS}"
+
+    def test_bash_syntax(self):
+        """bash -n must pass."""
+        result = subprocess.run(
+            ["bash", "-n", str(_PROD_STATUS)], capture_output=True, text=True
+        )
+        assert result.returncode == 0, f"bash -n failed:\n{result.stderr}"
+
+    def test_references_allowlist(self):
+        """inga-prod-status must read the allowlist to enumerate units."""
+        text = _PROD_STATUS.read_text()
+        assert "prod-allowlist.conf" in text or "ALLOWLIST" in text
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -53,24 +53,31 @@ All managed oneshot/timer units must exit 0 for the following conditions:
 | Universe file missing on business day | exit 1 |
 | API persistently down on a business day | exit 1 |
 
-### Allowlist — units to keep enabled
+### Allowlist — timer units to keep enabled
 
 Defined in [`shutdown/deploy/prod-allowlist.conf`](../shutdown/deploy/prod-allowlist.conf).
 
-Current managed units:
+**The allowlist holds `.timer` units, not `.service` units.**
+Services are oneshot units that the timer launches. Enabling the timer is the
+correct way to schedule them. `inga-prod-apply` verifies each timer is
+`is-enabled=enabled` and `is-active=active`, then checks that the corresponding
+`.service` is not in failed state. An `is-active=unknown` result means the unit
+file does not exist on this host — this is always an error, not a skip.
 
-| Unit | Script | Trigger |
-|------|--------|---------|
-| `inga-market-quotes-ingest.service` | `inga_market_quotes_ingest_jq300.sh` | Daily timer (JST weekdays) |
-| `inga-universe300-build.service` | `inga_universe300_build.sh` | Sunday 03:00 JST |
-| `inga-weekly-digest.service` | `inga_weekly_digest_wrapper.sh` → `notify_digest.py` | Weekly timer |
+Current managed timers:
 
-To add a unit: append to `prod-allowlist.conf` and run `sudo -n inga-prod-apply`.
+| Timer | Service (launched by timer) | Script | Trigger |
+|-------|-----------------------------|--------|---------|
+| `inga-market-quotes-ingest.timer` | `inga-market-quotes-ingest.service` | `inga_market_quotes_ingest_jq300.sh` | Daily (JST weekdays) |
+| `inga-universe300-build.timer` | `inga-universe300-build.service` | `inga_universe300_build.sh` | Sunday 03:00 JST |
+| `inga-weekly-digest.timer` | `inga-weekly-digest.service` | `inga_weekly_digest_wrapper.sh` → `notify_digest.py` | Weekly |
 
-To discover all inga units on the VPS:
+To add a unit: append `foo.timer` to `prod-allowlist.conf` and run `sudo -n inga-prod-apply`.
+
+To discover all inga timers on the VPS:
 ```bash
 systemctl list-timers --all | grep inga
-systemctl list-units 'inga-*' --all
+systemctl list-unit-files 'inga-*.timer'
 ```
 
 ### Denylist — units to disable + mask
@@ -107,45 +114,29 @@ What the bootstrap script does (idempotent, safe to re-run):
 ### Every deployment — password-free
 
 ```powershell
-# PowerShell — no password prompt
-
-# Step 1: Deploy scripts + systemd drop-ins from repo
-ssh inga@YOUR_VPS_HOST "sudo -n inga-deploy-shutdown"
-
-# Step 2: Apply production profile (enable allowlist, mask denylist, verify --failed is clean)
-ssh inga@YOUR_VPS_HOST "sudo -n inga-prod-apply"
-
-# Combined (stops on first failure):
-ssh inga@YOUR_VPS_HOST "sudo -n inga-deploy-shutdown && sudo -n inga-prod-apply"
+# PowerShell — single paste, no password prompt
+ssh -tt inga@YOUR_VPS_HOST "sudo -n inga-deploy-shutdown && sudo -n inga-prod-apply"
 ```
 
-### Dry-run (preview without changes)
+This command:
+1. Deploys scripts + systemd drop-ins from the repo to `/srv/inga/SHUTDOWN/bin/`
+2. Enables all allowlist timers, masks denylist units, verifies timer state is clean
+
+### Check production state
 
 ```powershell
-# PowerShell — shows what would happen, exits 0, no root required
-ssh inga@YOUR_VPS_HOST "bash /srv/inga-quants/shutdown/deploy/inga-deploy-shutdown --dry-run"
-ssh inga@YOUR_VPS_HOST "bash /srv/inga-quants/shutdown/deploy/inga-prod-apply --dry-run"
-```
+# PowerShell — timer schedule + per-unit state
+ssh inga@YOUR_VPS_HOST "bash /srv/inga-quants/shutdown/deploy/inga-prod-status"
 
-### Verify production state
-
-```powershell
-# PowerShell
-ssh inga@YOUR_VPS_HOST "systemctl --failed --no-pager"
+# Full verification (exits 1 if any timer is not enabled/active or service failed):
 ssh inga@YOUR_VPS_HOST "sudo -n inga-prod-apply && echo 'production OK'"
 ```
 
-```bash
-# On VPS directly
-# Check for any failed units
-systemctl --failed --no-pager
+### Dry-run (preview without changes, no root required)
 
-# Check managed units specifically
-systemctl status inga-market-quotes-ingest.service inga-universe300-build.service inga-weekly-digest.service
-
-# Test SKIP logic without network
-JQ_API_KEY="" bash /srv/inga/SHUTDOWN/bin/inga_market_quotes_ingest_jq300.sh
-# Expected: [SKIP] reason=api_key_missing   exit 0
+```powershell
+# PowerShell — shows what would happen, exits 0
+ssh inga@YOUR_VPS_HOST "bash /srv/inga-quants/shutdown/deploy/inga-prod-apply --dry-run"
 ```
 
 ### Troubleshooting: `sudo -n` fails with "password is required"
@@ -168,6 +159,13 @@ Expected output: two NOPASSWD lines, one for `/usr/local/sbin/`, one for `/usr/l
 The script is not installed to a directory in sudo's secure_path. The bootstrap
 installs to `/usr/local/sbin/` and `/usr/local/bin/` — both are in the default
 secure_path. Re-run the bootstrap to fix.
+
+### Troubleshooting: `ERR is-active=unknown`
+
+The timer unit file does not exist on this host. Either:
+- The `.timer` file has not been deployed yet (`sudo -n inga-deploy-shutdown` installs scripts, but systemd unit files must be placed separately)
+- Check with: `systemctl list-unit-files 'inga-*.timer'`
+- If the unit file is missing, it must be created in `/etc/systemd/system/` and `systemctl daemon-reload` run.
 
 ---
 
