@@ -45,6 +45,16 @@ do
   _log "  deployed: $DEST/$script"
 done
 
+# ── notify_digest.py ─────────────────────────────────────────────────────────
+NOTIFY_SRC="$SRC/tools/notify_digest.py"
+if [[ -f "$NOTIFY_SRC" ]]; then
+  cp "$NOTIFY_SRC" "$DEST/notify_digest.py"
+  chmod 640 "$DEST/notify_digest.py"
+  _log "  deployed: $DEST/notify_digest.py"
+else
+  _log "WARN: $NOTIFY_SRC not found — skipping notify_digest.py"
+fi
+
 # ── systemd drop-in ──────────────────────────────────────────────────────────
 OVERRIDE_SRC="$SRC/systemd/inga-weekly-digest.service.d/skip-wrapper.conf"
 if [[ -f "$OVERRIDE_SRC" ]]; then
