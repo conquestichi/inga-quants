@@ -122,6 +122,29 @@ This command:
 1. Deploys scripts + systemd drop-ins from the repo to `/srv/inga/SHUTDOWN/bin/`
 2. Enables all allowlist timers, masks denylist units, verifies timer state is clean
 
+### Pre-flight API key verification (one-time, before first deployment)
+
+Verify that `JQ_API_KEY` is valid before the scripts hit it at runtime:
+
+```powershell
+# PowerShell — no password required; exits 0 if OK, non-zero with clear message if not
+ssh inga@YOUR_VPS_HOST "bash -lc 'python3 /srv/inga/SHUTDOWN/bin/jq_api_smoketest.py'"
+```
+
+| Exit code | Meaning | Action |
+|-----------|---------|--------|
+| 0 | HTTP 200 — key valid, API reachable | Nothing to do |
+| 2 | Key not set in env | Set `JQ_API_KEY` in `inga_signals.env` |
+| 3 | HTTP 401 — key invalid or expired | Renew the J-Quants API key |
+| 4 | HTTP 403 — plan / endpoint restriction | Check J-Quants plan or endpoint access |
+| 5 | Timeout / network error | Check VPS outbound connectivity |
+| 6 | Other unexpected error | Check logs |
+
+The smoketest is also called automatically inside `inga_market_quotes_ingest_jq300.sh` and
+`inga_universe300_build.sh` after the existing SKIP guards (api_key_missing, non_trading_day)
+and before any real API calls.  Exit 3/4 from the smoketest becomes a systemd **FAIL** — this
+is intentional: auth/permission errors need human attention, unlike operational SKIPs.
+
 ### Check production state
 
 ```powershell
@@ -180,11 +203,31 @@ The timer unit file does not exist on this host. Either:
 
 ## Exit Code Reference
 
+### SHUTDOWN scripts (inga_market_quotes_ingest_jq300.sh, inga_universe300_build.sh)
+
 | Code | Meaning | systemd effect |
 |------|---------|---------------|
-| 0 | OK or operational SKIP | success — does not appear in `--failed` |
-| 1 | FAIL — genuine error requiring investigation | failed — appears in `--failed` |
-| 2 | Auth / infrastructure error (e.g. gh not authenticated) | — |
+| 0 | OK or operational SKIP (api_key_missing / non_trading_day / no_data) | success — does not appear in `--failed` |
+| 1 | FAIL — genuine error requiring investigation (BQ write, auth, network) | failed — appears in `--failed` |
+
+### jq_api_smoketest.py (called internally + available as standalone)
+
+| Code | Meaning |
+|------|---------|
+| 0 | HTTP 200 — key valid |
+| 2 | API key not set in any env var |
+| 3 | HTTP 401 — authentication failure |
+| 4 | HTTP 403 — plan / permission restriction |
+| 5 | Timeout or network error |
+| 6 | Other unexpected error |
+
+### Infra / deploy scripts
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Error (check output) |
+| 2 | Auth / infrastructure error (e.g. gh not authenticated) |
 
 ---
 

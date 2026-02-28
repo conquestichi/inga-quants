@@ -76,6 +76,20 @@ do
   fi
 done
 
+# ── jq_api_smoketest.py ──────────────────────────────────────────────────────
+SMOKETEST_SRC="$SRC/tools/jq_api_smoketest.py"
+if [[ -f "$SMOKETEST_SRC" ]]; then
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    cp "$SMOKETEST_SRC" "$DEST/jq_api_smoketest.py"
+    chmod 755 "$DEST/jq_api_smoketest.py"
+    _log "  deployed: $DEST/jq_api_smoketest.py"
+  else
+    _dry "cp $SMOKETEST_SRC $DEST/jq_api_smoketest.py && chmod 755"
+  fi
+else
+  _log "WARN: $SMOKETEST_SRC not found — skipping jq_api_smoketest.py"
+fi
+
 # ── notify_digest.py ─────────────────────────────────────────────────────────
 NOTIFY_SRC="$SRC/tools/notify_digest.py"
 if [[ -f "$NOTIFY_SRC" ]]; then

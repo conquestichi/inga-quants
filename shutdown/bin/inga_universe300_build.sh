@@ -45,6 +45,46 @@ fi
 # ─── SKIP: API key not set ───────────────────────────────────────────────────
 [[ -z "${JQ_API_KEY:-}" ]] && _log_skip "api_key_missing" "JQ_API_KEY not set in env"
 
+# ─── API smoketest (pre-flight auth verification) ────────────────────────────
+# Skip in dry-run mode (no network calls).
+# Fallback: deployed path first, then repo path.
+# _JQ_SMOKETEST_PATH env: override path (used in tests to inject a specific script).
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  if [[ -n "${_JQ_SMOKETEST_PATH:-}" ]]; then
+    _SMOKETEST="$_JQ_SMOKETEST_PATH"
+  else
+    _SMOKETEST=""
+    for _candidate in \
+      "/srv/inga/SHUTDOWN/bin/jq_api_smoketest.py" \
+      "$(dirname "$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")")/../tools/jq_api_smoketest.py"
+    do
+      [[ -f "$_candidate" ]] && { _SMOKETEST="$_candidate"; break; }
+    done
+  fi
+
+  if [[ -z "$_SMOKETEST" || ! -f "$_SMOKETEST" ]]; then
+    _log_fail "jq_api_smoketest.py not found (path=${_SMOKETEST:-<empty>}) — deploy is incomplete. Run: sudo -n inga-deploy-shutdown"
+  fi
+
+  _py3=""
+  for _p in "/srv/inga-quants/.venv/bin/python3" "python3"; do
+    command -v "$_p" >/dev/null 2>&1 && { _py3="$_p"; break; }
+  done
+  [[ -z "$_py3" ]] && _log_fail "python3 not found — cannot run API smoketest"
+
+  _smoketest_rc=0
+  "$_py3" "$_SMOKETEST" || _smoketest_rc=$?
+
+  case "$_smoketest_rc" in
+    0) ;;  # OK
+    2) _log_skip "api_key_missing" "smoketest: API key not set (rc=2)" ;;
+    3) _log_fail "API authentication failed (HTTP 401) — verify JQ_API_KEY is correct and not expired (smoketest rc=3)" ;;
+    4) _log_fail "API permission denied (HTTP 403) — check plan / endpoint access (smoketest rc=4)" ;;
+    5) _log_fail "API not reachable — timeout or network error (smoketest rc=5)" ;;
+    *) _log_fail "API smoketest failed with unexpected rc=${_smoketest_rc}" ;;
+  esac
+fi
+
 # ─── run setup (I/O: only after SKIP check passes) ───────────────────────────
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
