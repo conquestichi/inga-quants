@@ -8,7 +8,7 @@ priority order) and makes a single lightweight GET request to verify that the
 key is valid and the API is reachable.
 
 Exit codes:
-  0  — HTTP 200 (key valid, API up)
+  0  — HTTP 200 (key valid, API up) — or stamp present (already verified)
   2  — API key not set in any of the supported env vars
   3  — HTTP 401 (authentication failure — key wrong or expired)
   4  — HTTP 403 (permission / plan restriction)
@@ -16,8 +16,20 @@ Exit codes:
   6  — any other error (unexpected HTTP status, DNS failure, etc.)
 
 Never logs the API key value.
+
+Stamp (one-shot optimization):
+  On success (exit 0) a stamp file is written to $STATE/jq_api_smoketest.ok.json.
+  Subsequent runs exit 0 immediately without hitting the API.
+  Set FORCE=1 to bypass the stamp and re-run the full check.
+
+Environment:
+  JQ_API_KEY / JQUANTS_API_KEY / JQUANTS_APIKEY  — API key (first non-empty wins)
+  STATE   — directory for stamp file (default: /srv/inga/SHUTDOWN/state)
+  FORCE   — set to "1" to ignore the stamp and re-run
 """
 
+import datetime
+import json
 import os
 import sys
 import urllib.error
@@ -25,15 +37,16 @@ import urllib.request
 
 _BASE_URL = "https://api.jquants.com"
 _PATH = "/v2/equities/master"
-_CONNECT_TIMEOUT = 5
 _TOTAL_TIMEOUT = 15
 
 _URL = _BASE_URL + _PATH
 
+_STATE = os.environ.get("STATE", "/srv/inga/SHUTDOWN/state")
+_STAMP = os.path.join(_STATE, "jq_api_smoketest.ok.json")
+_FORCE = os.environ.get("FORCE", "0").strip() == "1"
+
 
 def _log(msg: str) -> None:
-    import datetime
-
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"{ts} [smoketest] {msg}", flush=True)
 
@@ -42,7 +55,27 @@ def _truncate(text: str, max_len: int = 200) -> str:
     return text if len(text) <= max_len else text[:max_len] + "…"
 
 
+def _write_stamp() -> None:
+    try:
+        os.makedirs(_STATE, exist_ok=True)
+        payload = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "result": "ok",
+            "endpoint": _URL,
+        }
+        with open(_STAMP, "w") as fh:
+            json.dump(payload, fh)
+        _log(f"stamp written: {_STAMP}")
+    except OSError as exc:
+        _log(f"WARN: could not write stamp (non-fatal): {exc}")
+
+
 def main() -> int:
+    # ── stamp check (skip if already verified, unless FORCE=1) ─────────────
+    if not _FORCE and os.path.isfile(_STAMP):
+        _log(f"stamp present — skipping pre-flight check (FORCE=1 to re-run): {_STAMP}")
+        return 0
+
     # ── key resolution (priority order) ────────────────────────────────────
     api_key = (
         os.environ.get("JQ_API_KEY")
@@ -96,6 +129,7 @@ def main() -> int:
 
     if http_status == 200:
         _log("OK: API key valid")
+        _write_stamp()
         return 0
     if http_status == 401:
         _log("auth_failure: HTTP 401 — key wrong or expired")

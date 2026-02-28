@@ -140,10 +140,22 @@ ssh inga@YOUR_VPS_HOST "bash -lc 'python3 /srv/inga/SHUTDOWN/bin/jq_api_smoketes
 | 5 | Timeout / network error | Check VPS outbound connectivity |
 | 6 | Other unexpected error | Check logs |
 
+**One-shot stamp** — on success the smoketest writes `$STATE/jq_api_smoketest.ok.json`.
+Subsequent invocations (from `inga-prod-apply` or the daily scripts) exit 0 immediately without
+hitting the network. Set `FORCE=1` to bypass the stamp and re-verify:
+
+```powershell
+ssh inga@YOUR_VPS_HOST "bash -lc 'FORCE=1 python3 /srv/inga/SHUTDOWN/bin/jq_api_smoketest.py'"
+```
+
+**Automatic integration** — `inga-prod-apply` runs the smoketest before enabling any allowlist
+timers. Exit 3/4 (401/403) abort prod-apply immediately — timers are **not** enabled until the
+key problem is fixed. This is intentional: auth/permission errors need human attention, unlike
+operational SKIPs (non_trading_day, no_data).
+
 The smoketest is also called automatically inside `inga_market_quotes_ingest_jq300.sh` and
 `inga_universe300_build.sh` after the existing SKIP guards (api_key_missing, non_trading_day)
-and before any real API calls.  Exit 3/4 from the smoketest becomes a systemd **FAIL** — this
-is intentional: auth/permission errors need human attention, unlike operational SKIPs.
+and before any real API calls.
 
 ### Check production state
 

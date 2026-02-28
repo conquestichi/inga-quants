@@ -176,6 +176,161 @@ class TestSmoketestPython:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Stamp mechanism tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSmoketestStamp:
+    """Stamp file allows skipping the pre-flight on subsequent runs."""
+
+    def test_stamp_present_skips_network(self, monkeypatch, tmp_path):
+        """If stamp exists and FORCE!=1, exit 0 without touching the network."""
+        stamp = tmp_path / "jq_api_smoketest.ok.json"
+        stamp.write_text('{"ts":"2026-01-01T00:00:00+00:00","result":"ok"}')
+        monkeypatch.setenv("STATE", str(tmp_path))
+        monkeypatch.setenv("FORCE", "0")
+        monkeypatch.setenv("JQ_API_KEY", "some-key")
+        mod = _import_smoketest()
+        # urlopen must NOT be called — use a side_effect that fails if called
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=AssertionError("network called")) as mock_open:
+            rc = mod.main()
+        assert rc == 0
+        mock_open.assert_not_called()
+
+    def test_force_bypasses_stamp(self, monkeypatch, tmp_path):
+        """FORCE=1 makes the smoketest run even when stamp exists."""
+        stamp = tmp_path / "jq_api_smoketest.ok.json"
+        stamp.write_text('{"ts":"2026-01-01T00:00:00+00:00","result":"ok"}')
+        monkeypatch.setenv("STATE", str(tmp_path))
+        monkeypatch.setenv("FORCE", "1")
+        monkeypatch.setenv("JQ_API_KEY", "some-key")
+        mod = _import_smoketest()
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_fake_response(200)):
+            rc = mod.main()
+        assert rc == 0  # ran the real check, HTTP 200
+
+    def test_success_writes_stamp(self, monkeypatch, tmp_path):
+        """HTTP 200 → stamp file created under STATE."""
+        monkeypatch.setenv("STATE", str(tmp_path))
+        monkeypatch.setenv("FORCE", "0")
+        monkeypatch.setenv("JQ_API_KEY", "some-key")
+        stamp = tmp_path / "jq_api_smoketest.ok.json"
+        assert not stamp.exists()
+        mod = _import_smoketest()
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_fake_response(200)):
+            rc = mod.main()
+        assert rc == 0
+        assert stamp.exists()
+        import json
+        data = json.loads(stamp.read_text())
+        assert data["result"] == "ok"
+        assert "ts" in data
+
+    def test_failure_does_not_write_stamp(self, monkeypatch, tmp_path):
+        """HTTP 401 → no stamp written."""
+        import urllib.error
+        monkeypatch.setenv("STATE", str(tmp_path))
+        monkeypatch.setenv("FORCE", "0")
+        monkeypatch.setenv("JQ_API_KEY", "bad-key")
+        mod = _import_smoketest()
+        exc = urllib.error.HTTPError(url="", code=401, msg="Unauthorized", hdrs={}, fp=None)
+        exc.read = lambda n=512: b'{"message":"Unauthorized"}'
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=exc):
+            rc = mod.main()
+        assert rc == 3
+        assert not (tmp_path / "jq_api_smoketest.ok.json").exists()
+
+    def test_no_stamp_runs_check(self, monkeypatch, tmp_path):
+        """No stamp file + FORCE=0 → runs the check normally."""
+        monkeypatch.setenv("STATE", str(tmp_path))
+        monkeypatch.setenv("FORCE", "0")
+        monkeypatch.setenv("JQ_API_KEY", "some-key")
+        mod = _import_smoketest()
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_fake_response(200)) as mock_open:
+            rc = mod.main()
+        assert rc == 0
+        mock_open.assert_called_once()
+
+    def test_stamp_path_in_output(self, monkeypatch, tmp_path, capsys):
+        """When stamp is found, its path appears in the log output."""
+        stamp = tmp_path / "jq_api_smoketest.ok.json"
+        stamp.write_text('{"ts":"2026-01-01T00:00:00+00:00","result":"ok"}')
+        monkeypatch.setenv("STATE", str(tmp_path))
+        monkeypatch.setenv("FORCE", "0")
+        monkeypatch.setenv("JQ_API_KEY", "some-key")
+        mod = _import_smoketest()
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=AssertionError("should not be called")):
+            mod.main()
+        captured = capsys.readouterr()
+        assert "stamp" in captured.out.lower()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# prod-apply structural tests (no root required)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_DEPLOY_DIR = Path(__file__).parent.parent / "shutdown" / "deploy"
+_PROD_APPLY = _DEPLOY_DIR / "inga-prod-apply"
+
+
+class TestProdApplySmoketestIntegration:
+    """Structural checks that prod-apply includes the smoketest pre-flight."""
+
+    def test_prod_apply_references_smoketest(self):
+        """prod-apply must reference jq_api_smoketest.py."""
+        content = _PROD_APPLY.read_text()
+        assert "jq_api_smoketest" in content
+
+    def test_prod_apply_fails_on_rc3(self):
+        """prod-apply script must exit 1 when smoketest returns rc=3."""
+        content = _PROD_APPLY.read_text()
+        assert "exit 1" in content
+        # Must have a case arm for rc=3 that exits
+        assert "3)" in content
+
+    def test_prod_apply_fails_on_rc4(self):
+        """prod-apply script must exit 1 when smoketest returns rc=4."""
+        content = _PROD_APPLY.read_text()
+        assert "4)" in content
+
+    def test_prod_apply_warns_on_rc2(self):
+        """prod-apply must warn (not fail) when smoketest returns rc=2."""
+        content = _PROD_APPLY.read_text()
+        # The rc=2 case arm must call _warn and must not call exit 1.
+        # Match single-line or multi-line arm: everything from "2)" up to ";;".
+        import re
+        match = re.search(r"2\)(.*?);;", content, re.DOTALL)
+        assert match, "rc=2 case arm not found in prod-apply"
+        arm_body = match.group(1)
+        assert "_warn" in arm_body, "rc=2 arm should call _warn"
+        assert "exit 1" not in arm_body, "rc=2 arm must NOT call exit 1 (key missing is non-fatal)"
+
+    def test_prod_apply_dry_run_mentions_smoketest(self, tmp_path):
+        """prod-apply --dry-run must mention smoketest in output."""
+        result = subprocess.run(
+            ["bash", str(_PROD_APPLY), "--dry-run"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "REPO": str(Path(__file__).parent.parent),
+                "HOME": os.environ.get("HOME", "/tmp"),
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            },
+            timeout=15,
+        )
+        combined = result.stdout + result.stderr
+        assert "smoketest" in combined.lower() or "jq_api_smoketest" in combined.lower(), (
+            f"Expected smoketest mention in dry-run output:\n{combined}"
+        )
+
+    def test_prod_apply_supports_jq_smoketest_path_env(self):
+        """prod-apply must support _JQ_SMOKETEST_PATH env for test injection."""
+        content = _PROD_APPLY.read_text()
+        assert "_JQ_SMOKETEST_PATH" in content
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Bash integration: smoketest path via _JQ_SMOKETEST_PATH env override
 # ──────────────────────────────────────────────────────────────────────────────
 # The bash scripts accept _JQ_SMOKETEST_PATH to override the fallback path

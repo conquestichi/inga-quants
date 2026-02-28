@@ -60,7 +60,57 @@ _parse_list() {
   grep -v '^\s*#' "$1" | grep -v '^\s*$' || true
 }
 
+STATE="${STATE:-/srv/inga/SHUTDOWN/state}"
+
 _log "inga-prod-apply: start dry=${DRY_RUN} repo=${REPO}"
+
+# ---------------------------------------------------------------------------
+# API smoketest pre-flight: verify JQ_API_KEY before enabling timers.
+# Skip in dry-run (no network).  Stamp in $STATE/jq_api_smoketest.ok.json.
+# rc=0 or rc=2 (key missing, timers will SKIP gracefully): continue.
+# rc=3/4 (401/403 — auth/plan error): EXIT 1 — do not enable timers.
+# rc=5/6 (network/other): EXIT 1.
+# Smoketest not found: WARN and continue (don't block prod-apply for deploy lag).
+# _JQ_SMOKETEST_PATH env: override path (for tests).
+# ---------------------------------------------------------------------------
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  if [[ -n "${_JQ_SMOKETEST_PATH:-}" ]]; then
+    _ST_PA="$_JQ_SMOKETEST_PATH"
+  else
+    _ST_PA=""
+    for _c in \
+      "/srv/inga/SHUTDOWN/bin/jq_api_smoketest.py" \
+      "$REPO/shutdown/tools/jq_api_smoketest.py"
+    do
+      [[ -f "$_c" ]] && { _ST_PA="$_c"; break; }
+    done
+  fi
+
+  if [[ -z "$_ST_PA" || ! -f "$_ST_PA" ]]; then
+    _warn "jq_api_smoketest.py not found — skipping pre-flight (run: sudo -n inga-deploy-shutdown)"
+  else
+    _py3=""
+    for _p in "/srv/inga-quants/.venv/bin/python3" "python3"; do
+      command -v "$_p" >/dev/null 2>&1 && { _py3="$_p"; break; }
+    done
+    if [[ -z "$_py3" ]]; then
+      _warn "python3 not found — skipping API smoketest pre-flight"
+    else
+      _st_rc=0
+      STATE="$STATE" "$_py3" "$_ST_PA" || _st_rc=$?
+      case "$_st_rc" in
+        0) _log "API smoketest: OK (key valid or stamp present)" ;;
+        2) _warn "API smoketest: JQ_API_KEY not set — timers will SKIP when triggered" ;;
+        3) echo "[ERR] API smoketest: HTTP 401 — key invalid or expired. Fix JQ_API_KEY before enabling timers." >&2; exit 1 ;;
+        4) echo "[ERR] API smoketest: HTTP 403 — permission denied (plan restriction?). Fix key or upgrade plan." >&2; exit 1 ;;
+        5) echo "[ERR] API smoketest: timeout/network error. Check VPS connectivity to api.jquants.com." >&2; exit 1 ;;
+        *) echo "[ERR] API smoketest: unexpected exit code ${_st_rc}." >&2; exit 1 ;;
+      esac
+    fi
+  fi
+else
+  _dry "python3 jq_api_smoketest.py  (pre-flight; skipped in dry-run)"
+fi
 
 # ---------------------------------------------------------------------------
 # Apply allowlist: enable + start each timer unit
