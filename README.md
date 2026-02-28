@@ -4,34 +4,39 @@ bootstrap ok
 
 ## PR 自動化 (`bin/pr_automerge.sh`)
 
-Claude Code による編集セッションの後、新ブランチの作成・テスト・PR 作成・auto-merge を
-ワンコマンドで実行します。
+Claude Code による編集セッションの後、**ノンインタラクティブ**に
+branch 作成 → テスト → PR 作成 → auto-merge セットまで一気に実行します。
+途中の Enter 待ちや確認プロンプトはありません。
 
 ```bash
-# 基本: tracked ファイルのみステージ → pytest → PR → auto-merge (ブランチ削除)
+# 基本: tracked ファイルのみステージ → pytest → PR → auto-merge
 bin/pr_automerge.sh fix/my-topic
 
 # ベースブランチ指定 & カスタムコミットメッセージ
 bin/pr_automerge.sh feat/new-feature --base develop --msg "feat: add new signal"
 
-# 未追跡ファイルも含める（data/, output/ など意図的に含めたい場合のみ）
+# 未追跡ファイルも含める（shutdown/bin/ など新規ファイルがある場合）
 bin/pr_automerge.sh fix/my-topic --include-untracked
 
-# pytest をスキップ（緊急 hotfix など）
+# CI完了 & merge まで待って、ローカル main を更新して終了
+bin/pr_automerge.sh fix/my-topic --wait-merge
+
+# pytest をスキップ
 bin/pr_automerge.sh hotfix/urgent --no-tests
 
-# ブランチを残す（merge 後も手元でブランチを保持）
-bin/pr_automerge.sh fix/my-topic --keep-branch
+# 旧挙動: Enter 待ちプロンプトを出す（--pause）
+bin/pr_automerge.sh fix/my-topic --pause
 
-# 何も実行せず、実行予定のコマンドだけ表示
+# 差分表示のみ（push/PR/merge しない）
 bin/pr_automerge.sh fix/my-topic --dry-run
 ```
 
-**デフォルト動作の安全策**
+**安全策**
 
-- `git add -u` で tracked ファイルのみステージ。`data/`・`output/` などの untracked ファイルを誤って commit しない。
-- base ブランチが clean でない場合は即座にエラー停止。
-- PR URL は `gh pr create --json url -q .url` で確実に取得（grep 依存なし）。
+- 差分ゼロなら即 exit 0（"No commits between HEAD and main" エラーを防止）。
+- `git add -u` で tracked ファイルのみステージ（`data/`・`output/` を誤 commit しない）。
+- `GH_TOKEN` 環境変数があれば `gh auth login --with-token` を自動実行（認証で止まらない）。
+- `--pause` を指定した場合のみ Enter 待ちプロンプトを表示（旧挙動互換）。
 
 ## CI (GitHub Actions)
 
@@ -82,13 +87,16 @@ JQ_API_KEY="" bash shutdown/bin/inga_universe300_build.sh
 # 3. dry-run
 JQ_API_KEY=xxx AS_OF=2026-02-10 bash shutdown/bin/inga_market_quotes_ingest_jq300.sh --dry-run
 
-# 4. ファイルのデプロイ (root)
+# 4. ファイルのデプロイ — NOPASSWD sudo (推奨)
+sudo inga-deploy-shutdown   # ← 初回セットアップ後はパスワード不要
+
+# または手動 (root)
 sudo cp shutdown/bin/inga_market_quotes_ingest_jq300.sh /srv/inga/SHUTDOWN/bin/
 sudo cp shutdown/bin/inga_universe300_build.sh          /srv/inga/SHUTDOWN/bin/
 sudo cp shutdown/bin/inga_weekly_digest_wrapper.sh      /srv/inga/SHUTDOWN/bin/
 sudo chmod 750 /srv/inga/SHUTDOWN/bin/*.sh
 
-# 5. weekly-digest のシステム override (root)
+# 5. weekly-digest のシステム override (root) — inga-deploy-shutdown が自動実施
 sudo mkdir -p /etc/systemd/system/inga-weekly-digest.service.d/
 sudo cp shutdown/systemd/inga-weekly-digest.service.d/skip-wrapper.conf \
          /etc/systemd/system/inga-weekly-digest.service.d/
@@ -99,6 +107,19 @@ sudo systemctl reset-failed inga-weekly-digest.service
 systemctl start inga-weekly-digest.service
 systemctl --failed | grep inga
 ```
+
+### NOPASSWD sudo の初回セットアップ (root で一度だけ)
+
+```bash
+sudo cp shutdown/deploy/inga-deploy-shutdown /usr/local/sbin/
+sudo chown root:root /usr/local/sbin/inga-deploy-shutdown
+sudo chmod 755 /usr/local/sbin/inga-deploy-shutdown
+sudo cp shutdown/deploy/inga-sudoers-deploy /etc/sudoers.d/inga-deploy-shutdown
+sudo chmod 440 /etc/sudoers.d/inga-deploy-shutdown
+sudo visudo -c   # 文法チェック
+```
+
+以降は `sudo inga-deploy-shutdown` がパスワードなしで実行できます。
 
 ### テスト環境変数
 

@@ -1,0 +1,9 @@
+# /etc/sudoers.d/inga-deploy-shutdown
+# Allow the 'inga' user to deploy SHUTDOWN scripts without a password.
+# Only the single deploy script is allowed — no shell escapes possible.
+#
+# Install:
+#   sudo cp shutdown/deploy/inga-sudoers-deploy /etc/sudoers.d/inga-deploy-shutdown
+#   sudo chmod 440 /etc/sudoers.d/inga-deploy-shutdown
+#   sudo visudo -c
+inga ALL=(root) NOPASSWD: /usr/local/sbin/inga-deploy-shutdown
