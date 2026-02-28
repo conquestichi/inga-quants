@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# /srv/inga-quants/shutdown/deploy/inga-prod-bootstrap
+#
+# One-time root setup: installs inga-deploy-shutdown + inga-prod-apply
+# to /usr/local/sbin/, creates /usr/local/bin/ symlinks, installs sudoers
+# fragments (NOPASSWD for 'inga' user), and self-tests the result.
+#
+# Run ONCE (with password, as root or via sudo):
+#   sudo bash /srv/inga-quants/shutdown/deploy/inga-prod-bootstrap
+#
+# After this, all day-to-day operations are password-free:
+#   sudo -n inga-deploy-shutdown
+#   sudo -n inga-prod-apply
+#
+# Idempotent: safe to re-run.
+set -euo pipefail
+
+_ts()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+_log()  { echo "$(_ts) [INFO] $*"; }
+_err()  { echo "$(_ts) [ERR]  $*" >&2; }
+_ok()   { echo "$(_ts) [OK]   $*"; }
+
+# ---------------------------------------------------------------------------
+# Root check
+# ---------------------------------------------------------------------------
+if [[ "$(id -u)" -ne 0 ]]; then
+  _err "inga-prod-bootstrap must run as root."
+  echo "  Fix: sudo bash /srv/inga-quants/shutdown/deploy/inga-prod-bootstrap" >&2
+  exit 1
+fi
+
+REPO="${REPO:-/srv/inga-quants}"
+DEPLOY_DIR="${REPO}/shutdown/deploy"
+
+# ---------------------------------------------------------------------------
+# Verify source files exist
+# ---------------------------------------------------------------------------
+for f in \
+  "${DEPLOY_DIR}/inga-deploy-shutdown" \
+  "${DEPLOY_DIR}/inga-prod-apply" \
+  "${DEPLOY_DIR}/inga-sudoers-deploy" \
+  "${DEPLOY_DIR}/inga-sudoers-prod"; do
+  if [[ ! -f "$f" ]]; then
+    _err "Source file missing: $f"
+    exit 1
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Install scripts to /usr/local/sbin/
+# ---------------------------------------------------------------------------
+_log "Installing scripts to /usr/local/sbin/ ..."
+
+for script in inga-deploy-shutdown inga-prod-apply; do
+  install -o root -g root -m 755 \
+    "${DEPLOY_DIR}/${script}" \
+    "/usr/local/sbin/${script}"
+  _ok "  /usr/local/sbin/${script}"
+done
+
+# ---------------------------------------------------------------------------
+# Create /usr/local/bin/ symlinks (symlink-tolerance for sudo PATH variations)
+# ---------------------------------------------------------------------------
+_log "Creating /usr/local/bin/ symlinks ..."
+
+for script in inga-deploy-shutdown inga-prod-apply; do
+  ln -sf "/usr/local/sbin/${script}" "/usr/local/bin/${script}"
+  _ok "  /usr/local/bin/${script} -> /usr/local/sbin/${script}"
+done
+
+# ---------------------------------------------------------------------------
+# Install sudoers fragments
+# ---------------------------------------------------------------------------
+_log "Installing sudoers fragments ..."
+
+install -o root -g root -m 440 \
+  "${DEPLOY_DIR}/inga-sudoers-deploy" \
+  /etc/sudoers.d/inga-deploy-shutdown
+_ok "  /etc/sudoers.d/inga-deploy-shutdown"
+
+install -o root -g root -m 440 \
+  "${DEPLOY_DIR}/inga-sudoers-prod" \
+  /etc/sudoers.d/inga-prod-apply
+_ok "  /etc/sudoers.d/inga-prod-apply"
+
+# ---------------------------------------------------------------------------
+# Validate sudoers syntax
+# ---------------------------------------------------------------------------
+_log "Validating sudoers syntax ..."
+if visudo -cf /etc/sudoers.d/inga-deploy-shutdown && \
+   visudo -cf /etc/sudoers.d/inga-prod-apply; then
+  _ok "  visudo -c: parsed OK"
+else
+  _err "visudo validation failed — check sudoers fragments"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Self-test: verify NOPASSWD grants visible to 'inga' user
+# ---------------------------------------------------------------------------
+_log "Self-test: sudo -l -U inga ..."
+if id inga &>/dev/null; then
+  sudo -l -U inga 2>&1 | grep -E 'inga-(deploy-shutdown|prod-apply)' | while read -r line; do
+    _ok "  $line"
+  done
+  # Check both scripts appear
+  for script in inga-deploy-shutdown inga-prod-apply; do
+    if sudo -l -U inga 2>/dev/null | grep -q "$script"; then
+      _ok "  NOPASSWD confirmed: $script"
+    else
+      _err "  NOPASSWD NOT found for: $script"
+      _err "  Run: sudo -l -U inga   to inspect"
+      exit 1
+    fi
+  done
+else
+  _log "  (user 'inga' not found — skipping NOPASSWD self-test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
+echo ""
+_ok "inga-prod-bootstrap complete."
+echo ""
+echo "  Day-to-day commands (no password required):"
+echo "    sudo -n inga-deploy-shutdown          # deploy scripts from repo"
+echo "    sudo -n inga-deploy-shutdown --dry-run"
+echo "    sudo -n inga-prod-apply               # apply production profile"
+echo "    sudo -n inga-prod-apply --dry-run"
+echo ""
+echo "  Verify production state:"
+echo "    systemctl --failed --no-pager"
+echo "    sudo -n inga-prod-apply && echo 'production OK'"
