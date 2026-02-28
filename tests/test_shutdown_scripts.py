@@ -34,7 +34,7 @@ _BASE_ENV = {
 def _run(script: Path, extra_env: dict | None = None, args: list[str] | None = None) -> subprocess.CompletedProcess:
     env = {**_BASE_ENV, **(extra_env or {})}
     cmd = ["bash", str(script)] + (args or [])
-    return subprocess.run(cmd, capture_output=True, text=True, env=env)
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -174,6 +174,52 @@ class TestUniverseDryRun:
         """--dry-run output mentions 'would fetch' or '[DRY]'."""
         result = _run(_UNIVERSE, {"JQ_API_KEY": "dummy-key-for-test"}, args=["--dry-run"])
         assert "[DRY]" in result.stdout
+
+
+class TestUniversePathOverride:
+    def test_out_env_override_dry_run(self, tmp_path):
+        """OUT env override is honoured — dry-run exits 0 with custom OUT path."""
+        out_path = tmp_path / "universe300.txt"
+        result = _run(
+            _UNIVERSE,
+            {
+                "JQ_API_KEY": "dummy-key-for-test",
+                "OUT": str(out_path),
+                "BASE": str(tmp_path),
+            },
+            args=["--dry-run"],
+        )
+        assert result.returncode == 0, f"dry-run with OUT override failed:\n{result.stdout}\n{result.stderr}"
+        assert "[DRY]" in result.stdout
+
+    def test_base_env_override_dry_run(self, tmp_path):
+        """BASE env override propagates to OUT — dry-run exits 0."""
+        result = _run(
+            _UNIVERSE,
+            {
+                "JQ_API_KEY": "dummy-key-for-test",
+                "BASE": str(tmp_path),
+            },
+            args=["--dry-run"],
+        )
+        assert result.returncode == 0, f"dry-run with BASE override failed:\n{result.stdout}\n{result.stderr}"
+
+
+class TestIngestProbeAuthError:
+    def test_script_has_auth_error_detection(self):
+        """Ingest script must detect 401/403 auth errors in probe loop."""
+        text = _INGEST.read_text()
+        assert "401" in text or "403" in text, (
+            "Ingest probe loop does not check for 401/403 auth errors — "
+            "persistent auth failures would show uninformative error messages"
+        )
+
+    def test_script_has_auth_error_fail_message(self):
+        """Ingest script must emit a specific message when auth errors detected."""
+        text = _INGEST.read_text()
+        assert "auth" in text.lower() or "authentication" in text.lower(), (
+            "Ingest script missing auth-failure FAIL message for probe 401/403 responses"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

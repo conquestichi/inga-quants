@@ -261,6 +261,72 @@ class TestProdStatusScript:
         text = _PROD_STATUS.read_text()
         assert "prod-allowlist.conf" in text or "ALLOWLIST" in text
 
+    def test_has_check_flag(self):
+        """inga-prod-status must support --check flag for exit 1 on anomaly."""
+        text = _PROD_STATUS.read_text()
+        assert "--check" in text, "inga-prod-status missing --check flag support"
+
+
+class TestProdStatusCheckMode:
+    """Functional tests for inga-prod-status --check mode.
+
+    Uses a custom ALLOWLIST= env var to control which units are checked.
+    In CI: systemctl is not connected to real system, so nonexistent units
+    return 'unknown' from `|| echo unknown` fallback — allowing exit-1 testing.
+    """
+
+    def test_check_exits_0_empty_allowlist(self, tmp_path):
+        """--check with empty allowlist exits 0 (no units to check = no errors)."""
+        allowlist = tmp_path / "allowlist.conf"
+        allowlist.write_text("# empty — no units\n")
+        result = subprocess.run(
+            ["bash", str(_PROD_STATUS), "--check"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env={**__import__("os").environ, "ALLOWLIST": str(allowlist)},
+            timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"--check with empty allowlist should exit 0:\n{result.stdout}\n{result.stderr}"
+        )
+
+    def test_check_exits_1_unknown_timer(self, tmp_path):
+        """--check with a nonexistent timer exits 1 (unit unknown = missing)."""
+        allowlist = tmp_path / "allowlist.conf"
+        allowlist.write_text("inga-definitely-does-not-exist.timer\n")
+        result = subprocess.run(
+            ["bash", str(_PROD_STATUS), "--check"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env={**__import__("os").environ, "ALLOWLIST": str(allowlist)},
+            timeout=15,
+        )
+        assert result.returncode == 1, (
+            f"--check with missing timer should exit 1:\n{result.stdout}\n{result.stderr}"
+        )
+        combined = result.stdout + result.stderr
+        assert "ERR" in combined or "unknown" in combined, (
+            "Exit 1 output should mention ERR or unknown"
+        )
+
+    def test_default_exits_0_regardless_of_unit_state(self, tmp_path):
+        """Default mode (no --check) always exits 0 even with missing units."""
+        allowlist = tmp_path / "allowlist.conf"
+        allowlist.write_text("inga-definitely-does-not-exist.timer\n")
+        result = subprocess.run(
+            ["bash", str(_PROD_STATUS)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env={**__import__("os").environ, "ALLOWLIST": str(allowlist)},
+            timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"Default mode should always exit 0:\n{result.stdout}\n{result.stderr}"
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # docs/PRODUCTION.md consistency

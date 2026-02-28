@@ -4,15 +4,23 @@
 # Does NOT require root. Read-only — no systemctl start/stop.
 #
 # Usage:
-#   inga-prod-status           # full output
-#   inga-prod-status --short   # condensed (timer table only)
+#   inga-prod-status           # display only — always exits 0
+#   inga-prod-status --check   # display + exit 1 if any anomaly detected
+#   inga-prod-status --short   # condensed (timer table only) — always exits 0
+#
+# Anomaly = timer is-enabled != "enabled", is-active != "active",
+#            corresponding service is-failed, or unit is "unknown" (missing)
 set -euo pipefail
 
 SHORT=0
-for arg in "$@"; do [[ "$arg" == "--short" ]] && SHORT=1; done
+CHECK=0
+for arg in "$@"; do
+  [[ "$arg" == "--short" ]] && SHORT=1
+  [[ "$arg" == "--check" ]] && CHECK=1
+done
 
 REPO="${REPO:-/srv/inga-quants}"
-ALLOWLIST="${REPO}/shutdown/deploy/prod-allowlist.conf"
+ALLOWLIST="${ALLOWLIST:-$REPO/shutdown/deploy/prod-allowlist.conf}"
 
 _parse_list() {
   grep -v '^\s*#' "$1" | grep -v '^\s*$' || true
@@ -23,16 +31,23 @@ echo ""
 
 # ---------------------------------------------------------------------------
 # Timer table (next trigger + last activation)
+# grep matches: header line (^NEXT) or any line containing inga- (covers n/a lines too)
 # ---------------------------------------------------------------------------
 echo "Timers (next / last):"
 systemctl list-timers --all --no-pager 2>/dev/null \
-  | grep -E '^(NEXT|[A-Z].*inga-)' || \
-  echo "  (systemctl not available)"
+  | grep -E '(inga-|^NEXT)' || \
+  echo "  (systemctl not available or no inga timers found)"
 echo ""
+
+if [[ "$SHORT" -eq 1 ]]; then
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Per-unit summary from allowlist
 # ---------------------------------------------------------------------------
+errors=()
+
 echo "Allowlist unit state:"
 if [[ ! -f "$ALLOWLIST" ]]; then
   echo "  (allowlist not found: $ALLOWLIST)"
@@ -44,26 +59,65 @@ else
       enabled="$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)"
       active="$(systemctl is-active  "$unit" 2>/dev/null || echo unknown)"
       svc_st="$(systemctl is-active  "$svc"  2>/dev/null || echo unknown)"
-      failed=""
-      systemctl is-failed --quiet "$svc" 2>/dev/null && failed=" *** FAILED ***"
+      svc_failed=0
+      systemctl is-failed --quiet "$svc" 2>/dev/null && svc_failed=1 || true
+
+      # Anomaly detection
+      if [[ "$enabled" != "enabled" ]]; then
+        errors+=("${unit}: is-enabled=${enabled} (expected: enabled)")
+      fi
+      if [[ "$active" == "unknown" ]]; then
+        errors+=("${unit}: is-active=unknown (unit file missing on this host)")
+      elif [[ "$active" != "active" ]]; then
+        errors+=("${unit}: is-active=${active} (expected: active)")
+      fi
+      if [[ "$svc_failed" -eq 1 ]]; then
+        errors+=("${svc}: is-failed (last service run failed)")
+      fi
+
+      # Build display line with anomaly marker
+      anomaly=""
+      [[ "$enabled" != "enabled" ]] && anomaly=" [!enabled=${enabled}]"
+      [[ "$active" != "active" ]] && anomaly+=" [!active=${active}]"
+      [[ "$svc_failed" -eq 1 ]] && anomaly+=" [!svc=FAILED]"
       printf "  %-42s enabled=%-10s timer=%-10s svc=%s%s\n" \
-        "$unit" "$enabled" "$active" "$svc_st" "$failed"
+        "$unit" "$enabled" "$active" "$svc_st" "$anomaly"
     else
       active="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
-      failed=""
-      systemctl is-failed --quiet "$unit" 2>/dev/null && failed=" *** FAILED ***"
-      printf "  %-42s active=%s%s\n" "$unit" "$active" "$failed"
+      failed=0
+      systemctl is-failed --quiet "$unit" 2>/dev/null && failed=1 || true
+
+      if [[ "$active" == "unknown" ]]; then
+        errors+=("${unit}: is-active=unknown (unit file missing on this host)")
+      elif [[ "$failed" -eq 1 ]]; then
+        errors+=("${unit}: is-failed")
+      fi
+
+      anomaly=""
+      [[ "$active" == "unknown" ]] && anomaly=" [!unknown]"
+      [[ "$failed" -eq 1 ]] && anomaly+=" [!FAILED]"
+      printf "  %-42s active=%s%s\n" "$unit" "$active" "$anomaly"
     fi
   done < <(_parse_list "$ALLOWLIST")
 fi
 echo ""
-
-if [[ "$SHORT" -eq 1 ]]; then
-  exit 0
-fi
 
 # ---------------------------------------------------------------------------
 # Global --failed snapshot
 # ---------------------------------------------------------------------------
 echo "systemctl --failed (all units):"
 systemctl --failed --no-pager 2>/dev/null | head -30 || echo "  (systemctl not available)"
+
+# ---------------------------------------------------------------------------
+# --check: exit 1 if any anomaly detected
+# ---------------------------------------------------------------------------
+if [[ "$CHECK" -eq 1 && ${#errors[@]} -gt 0 ]]; then
+  echo ""
+  echo "── errors ──────────────────────────────────────────────────────"
+  for e in "${errors[@]}"; do
+    echo "  ERR: $e"
+  done
+  echo ""
+  echo "Fix the units above, then re-run: sudo -n inga-prod-apply"
+  exit 1
+fi
